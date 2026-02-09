@@ -264,6 +264,12 @@ dev = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "pyright" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "pytest-mock" },
+    { name = "ruff" },
     { name = "poethepoet" },
 ]
 
@@ -287,7 +293,15 @@ requires-dist = [
 provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "poethepoet", specifier = ">=0.40.0" }]
+dev = [
+    { name = "pyright", specifier = ">=1.1.0" },
+    { name = "pytest", specifier = ">=8.3.0" },
+    { name = "pytest-asyncio", specifier = ">=1.0.0" },
+    { name = "pytest-cov", specifier = ">=6.0.0" },
+    { name = "pytest-mock", specifier = ">=3.14.0" },
+    { name = "ruff", specifier = ">=0.8.0" },
+    { name = "poethepoet", specifier = ">=0.40.0" },
+]
 
 [[package]]
 name = "nodeenv"

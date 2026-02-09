@@ -53,6 +53,12 @@ typeCheckingMode = "basic"
 
 [dependency-groups]
 dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=1.0.0",
+    "pytest-cov>=6.0.0",
+    "pytest-mock>=3.14.0",
+    "ruff>=0.8.0",
+    "pyright>=1.1.0",
     "poethepoet>=0.40.0",
 ]
 
