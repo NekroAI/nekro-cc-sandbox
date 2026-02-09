@@ -1,0 +1,543 @@
+"""Claude Code runtime management"""
+
+import asyncio
+import json
+import os
+import re
+import shlex
+from collections import Counter, deque
+from collections.abc import AsyncGenerator, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any
+
+from loguru import logger
+
+from ..errors import ClaudeCliError, ErrorCode, new_err_id
+from ..workspace import WorkspaceManager
+from .policy import RuntimePolicy
+
+
+@dataclass
+class ClaudeSession:
+    """Represents a Claude Code session"""
+
+    session_id: str
+    workspace_id: str
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    last_active: datetime = field(default_factory=lambda: datetime.now(UTC))
+    is_active: bool = True
+
+
+class ClaudeRuntime:
+    """
+    Manages Claude Code as a Workspace Agent.
+
+    Key principles:
+    - Session persistence across requests (by storing `session_id` in workspace state)
+    - Prefer *one-shot* Agent SDK CLI invocations (`claude -p`) over a long-lived REPL subprocess
+      because:
+        - Claude Code `-p` output and permissions are designed for programmatic use
+        - Running `claude` under pipes (no TTY) can hang in some environments; we use a pseudo-tty
+          wrapper to make behavior reliable (see `.cursor/docs/knowledge.md`)
+    """
+
+    def __init__(
+        self,
+        workspace_manager: WorkspaceManager,
+        skip_permissions: bool = True,
+        env_overrides: dict[str, str] | None = None,
+        policy: RuntimePolicy | None = None,
+    ) -> None:
+        self.workspace_manager: WorkspaceManager = workspace_manager
+        self.skip_permissions: bool = skip_permissions
+        self.env_overrides: dict[str, str] = env_overrides or {}
+        self.policy: RuntimePolicy = policy or RuntimePolicy.relaxed()
+        self._lock: asyncio.Lock = asyncio.Lock()
+        self._sessions: dict[str, ClaudeSession] = {}
+        self._active_workspace_id: str = "default"
+        self._last_init_tools: dict[str, list[str]] = {}
+
+        # ANSI stripping (pseudo-tty wrapper may emit terminal controls)
+        self._ansi_csi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+        self._ansi_osc = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+
+    def _strip_ansi_and_controls(self, text: str) -> str:
+        stripped = self._ansi_csi.sub("", text)
+        stripped = self._ansi_osc.sub("", stripped)
+        # Keep printable chars + common whitespace
+        return "".join(ch for ch in stripped if ch in ("\n", "\r", "\t") or ord(ch) >= 32)
+
+    def _is_uuid(self, value: str) -> bool:
+        # Claude Code session_id is a UUID string in practice.
+        return bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", value))
+
+    async def start(self, workspace_id: str = "default") -> ClaudeSession:
+        """Ensure workspace exists and load session state."""
+        async with self._lock:
+            self._active_workspace_id = workspace_id
+            workspace = await self.workspace_manager.get_workspace(workspace_id)
+            if not workspace:
+                logger.debug(f"[ClaudeRuntime] Creating new workspace: {workspace_id}")
+                workspace = await self.workspace_manager.create_default_workspace(workspace_id)
+
+            existing = self._sessions.get(workspace_id)
+            if existing:
+                existing.last_active = datetime.now(UTC)
+                # Keep in sync with persisted workspace state
+                if workspace.session_id and existing.session_id != workspace.session_id:
+                    existing.session_id = workspace.session_id
+                return existing
+
+            session = ClaudeSession(
+                session_id=workspace.session_id or "",
+                workspace_id=workspace_id,
+            )
+            self._sessions[workspace_id] = session
+            return session
+
+    def _build_claude_cmd(self, prompt: str, session_id: str | None) -> list[str]:
+        disallowed: set[str] = set(self.policy.blocked_tools)
+        if not self.policy.allow_command_execution:
+            disallowed.add("Bash")
+        if not self.policy.allow_file_modification:
+            disallowed.update({"Write", "Edit"})
+        if not self.policy.allow_network:
+            disallowed.update({"WebFetch", "WebSearch"})
+
+        cmd = [
+            "claude",
+            "-p",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+        ]
+        if self.skip_permissions:
+            cmd.append("--dangerously-skip-permissions")
+        if self.policy.allowed_tools:
+            # 约束：--tools 才是真正“限制可用工具”的开关，避免把 --allowedTools 误当成白名单
+            cmd.extend(["--tools", ",".join(sorted(self.policy.allowed_tools))])
+        if disallowed:
+            cmd.append("--disallowedTools")
+            cmd.extend(sorted(disallowed))
+        if session_id:
+            cmd.extend(["--resume", session_id])
+        # Prevent prompt from being parsed as an option
+        cmd.append("--")
+        cmd.append(prompt)
+        return cmd
+
+    def _build_pseudotty_wrapper_cmd(self, claude_cmd: list[str]) -> list[str]:
+        """
+        Wrap `claude` invocation with a pseudo-tty to avoid hangs under pipes.
+
+        On Linux, `script(1)` is widely available (util-linux).
+        """
+        shell_cmd = shlex.join(claude_cmd)
+        return ["script", "-q", "-c", shell_cmd, "/dev/null"]
+
+    async def _iter_stream_json_objects(
+        self,
+        stdout: asyncio.StreamReader,
+        *,
+        on_line: Callable[[str, str], None] | None = None,
+    ) -> AsyncGenerator[dict[str, Any]]:
+        while True:
+            raw = await stdout.readline()
+            if not raw:
+                break
+            decoded = raw.decode("utf-8", errors="replace")
+            decoded = self._strip_ansi_and_controls(decoded)
+            line = decoded.strip()
+            if not line:
+                if on_line is not None:
+                    on_line("", "skip_empty")
+                continue
+            # Ignore common pty residue (e.g. "[<u")
+            if line.startswith("["):
+                if on_line is not None:
+                    on_line(line, "skip_bracket_prefix")
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                if on_line is not None:
+                    on_line(line, "skip_json_decode_error")
+                continue
+            if isinstance(obj, dict):
+                if on_line is not None:
+                    obj_type = obj.get("type")
+                    on_line(line, f"yield:{obj_type}" if isinstance(obj_type, str) else "yield:<no-type>")
+                yield obj
+
+    async def send_message(self, message: str) -> AsyncGenerator[str]:
+        """
+        Send one message to Claude Code using Agent SDK CLI (`claude -p`).
+
+        Output parsing rules are based on real `stream-json` behavior:
+        - `stream_event.content_block_delta` with `text_delta` contains incremental text
+        - final `result.result` contains the full text
+        - tool calls/results appear as `assistant.message.content[].type=tool_use`
+          and `user.message.content[].type=tool_result` (see knowledge doc)
+        """
+        raise RuntimeError("send_message(message) must be called with workspace context")
+
+    async def send_message_in_workspace(self, workspace_id: str, message: str) -> AsyncGenerator[str]:
+        logger.info(f"[ClaudeRuntime] send_message({workspace_id}): {message[:120]}...")
+        session = await self.start(workspace_id)
+        workspace = await self.workspace_manager.get_workspace(workspace_id)
+        if not workspace:
+            raise ClaudeCliError(
+                code=ErrorCode.WORKSPACE_NOT_FOUND,
+                message=f"Workspace not found: {workspace_id}",
+                retryable=False,
+                details={"workspace_id": workspace_id},
+                err_id=new_err_id(),
+            )
+
+        # Only pass --resume when we have a real UUID session id.
+        # Older versions of this project stored synthetic ids (e.g. "ws-default-...") which
+        # should not be used with Claude Code.
+        resume_id = session.session_id if (session.session_id and self._is_uuid(session.session_id)) else None
+
+        env = os.environ.copy()
+        env.update(self.env_overrides)
+
+        attempt_resume_id = resume_id
+        for attempt in range(2):
+            claude_cmd = self._build_claude_cmd(prompt=message, session_id=attempt_resume_id)
+            cmd = self._build_pseudotty_wrapper_cmd(claude_cmd)
+            logger.debug(f"[ClaudeRuntime] Exec(attempt={attempt}): {cmd!r} (cwd={workspace.path})")
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(workspace.path),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+
+            assert proc.stdout is not None
+            assert proc.stderr is not None
+
+            yielded_any_text = False
+            final_result_text: str | None = None
+            new_session_id: str | None = None
+            last_assistant_text: str | None = None
+            parsed_objects = 0
+            cli_error_summary: str | None = None
+            cli_errors: list[str] | None = None
+            cli_error_details: dict[str, Any] | None = None
+
+            stdout_tail: deque[str] = deque(maxlen=30)
+            stdout_skipped_tail: deque[str] = deque(maxlen=30)
+            line_stats: Counter[str] = Counter()
+            seen_types: Counter[str] = Counter()
+
+            def _on_line(line: str, status: str) -> None:
+                line_stats[status] += 1
+                if status.startswith("yield:"):
+                    if line:
+                        stdout_tail.append(line[:500])
+                elif status.startswith("skip"):
+                    if line:
+                        stdout_skipped_tail.append(line[:500])
+
+            async for obj in self._iter_stream_json_objects(proc.stdout, on_line=_on_line):
+                parsed_objects += 1
+                obj_type = obj.get("type")
+                if isinstance(obj_type, str):
+                    seen_types[obj_type] += 1
+                if obj_type == "stream_event":
+                    event = obj.get("event", {})
+                    if isinstance(event, dict) and event.get("type") == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            if isinstance(text, str) and text:
+                                yielded_any_text = True
+                                yield text
+                elif obj_type == "system" and obj.get("subtype") == "init":
+                    tools = obj.get("tools")
+                    if isinstance(tools, list) and all(isinstance(x, str) for x in tools):
+                        self._last_init_tools[workspace_id] = tools
+                elif obj_type == "assistant":
+                    # Fallback signal: some outputs may only appear as message snapshots.
+                    msg = obj.get("message", {})
+                    if isinstance(msg, dict):
+                        content = msg.get("content", [])
+                        if isinstance(content, list):
+                            text_parts: list[str] = []
+                            for block in content:
+                                if isinstance(block, dict) and block.get("type") == "text":
+                                    t = block.get("text", "")
+                                    if isinstance(t, str) and t:
+                                        text_parts.append(t)
+                            if text_parts:
+                                last_assistant_text = "".join(text_parts)
+                elif obj_type == "result":
+                    subtype = obj.get("subtype")
+                    is_error = bool(obj.get("is_error")) or (
+                        isinstance(subtype, str) and subtype.startswith("error")
+                    )
+
+                    # Capture final text if provided
+                    result_text = obj.get("result")
+                    if isinstance(result_text, str):
+                        final_result_text = result_text
+
+                    # Only persist session_id for successful results. Some error results return a fresh
+                    # UUID even though no conversation exists (e.g. "No conversation found...").
+                    sid = obj.get("session_id")
+                    if not is_error and isinstance(sid, str) and sid:
+                        new_session_id = sid
+
+                    # Enrich error summary with `errors[]` if present
+                    errors_raw = obj.get("errors")
+                    if isinstance(errors_raw, list) and all(isinstance(x, str) for x in errors_raw):
+                        cli_errors = list(errors_raw)
+
+                    if is_error:
+                        permission_denials = obj.get("permission_denials")
+                        pd_preview: list[Any] | None = None
+                        if isinstance(permission_denials, list):
+                            pd_preview = permission_denials[:3]
+                        # keep preview only; full list may be large
+                        preview: list[str] | None = None
+                        if cli_errors:
+                            preview = cli_errors[:3]
+                        cli_error_summary = "Claude CLI returned error result"
+                        cli_error_details = {
+                            "subtype": subtype,
+                            "permission_denials_preview": pd_preview if isinstance(permission_denials, list) else permission_denials,
+                            "errors_preview": preview if cli_errors else None,
+                        }
+
+            # Ensure process is done and capture stderr for debugging
+            stderr_bytes = await proc.stderr.read()
+            _ = await proc.wait()
+            stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+            if proc.returncode not in (0, None) and stderr_text:
+                logger.warning(f"[ClaudeRuntime] Non-zero exit={proc.returncode}, stderr={stderr_text[:2000]}")
+
+            # Persist updated session_id if present
+            if new_session_id and new_session_id != session.session_id:
+                session.session_id = new_session_id
+                await self.workspace_manager.update_session(workspace_id, new_session_id)
+                logger.info(f"[ClaudeRuntime] Updated session_id: {new_session_id}")
+
+            # Fallback: if we didn't get incremental deltas, yield the final result
+            if not yielded_any_text and final_result_text:
+                yield final_result_text
+                return
+
+            # Second fallback: no `result.result`, try assistant snapshot text
+            if not yielded_any_text and last_assistant_text:
+                yield last_assistant_text
+                return
+
+            if not yielded_any_text:
+                # Stale/invalid resume id: retry once without --resume
+                if (
+                    attempt == 0
+                    and attempt_resume_id
+                    and cli_errors
+                    and any("No conversation found with session ID" in e for e in cli_errors)
+                ):
+                    logger.warning(
+                        "[ClaudeRuntime] Resume session not found; retrying without --resume. "
+                        f"workspace_id={workspace_id} resume_id={attempt_resume_id!r}"
+                    )
+                    attempt_resume_id = None
+                    session.session_id = ""
+                    await self.workspace_manager.update_session(workspace_id, "")
+                    continue
+
+                if cli_error_summary:
+                    err_id = new_err_id()
+                    logger.error(f"[ClaudeRuntime] {cli_error_summary} err_id={err_id} details={cli_error_details!r}")
+                    raise ClaudeCliError(
+                        code=ErrorCode.CLAUDE_CLI_ERROR_RESULT,
+                        message=cli_error_summary,
+                        retryable=True,
+                        details=cli_error_details,
+                        err_id=err_id,
+                    )
+
+                logger.error(
+                    "[ClaudeRuntime] No parseable text output. "
+                    f"workspace_id={workspace_id} "
+                    f"resume_id={attempt_resume_id!r} "
+                    f"parsed_objects={parsed_objects} "
+                    f"seen_types={dict(seen_types)} "
+                    f"line_stats={dict(line_stats)} "
+                    f"exit={proc.returncode} "
+                    f"stderr={stderr_text[:500]!r} "
+                    f"stdout_tail={list(stdout_tail)!r} "
+                    f"stdout_skipped_tail={list(stdout_skipped_tail)!r}"
+                )
+                err_id = new_err_id()
+                logger.error(f"[ClaudeRuntime] err_id={err_id} code=CLAUDE_CLI_NO_PARSEABLE_OUTPUT workspace_id={workspace_id}")
+                raise ClaudeCliError(
+                    code=ErrorCode.CLAUDE_CLI_NO_PARSEABLE_OUTPUT,
+                    message="Claude produced no parseable text output",
+                    retryable=True,
+                    details={
+                        "workspace_id": workspace_id,
+                        "resume_id": attempt_resume_id,
+                        "parsed_objects": parsed_objects,
+                        "seen_types": dict(seen_types),
+                        "line_stats": dict(line_stats),
+                        "exit": proc.returncode,
+                        "stderr_preview": stderr_text[:500],
+                    },
+                    err_id=err_id,
+                )
+
+    async def shutdown(self) -> None:
+        """Shutdown runtime (no persistent subprocess)."""
+        logger.info("[ClaudeRuntime] Shutting down...")
+        self._sessions.clear()
+        logger.info("[ClaudeRuntime] Shutdown complete")
+
+    async def reset_workspace_session(self, workspace_id: str) -> None:
+        """重置指定工作区的会话（清理内存缓存；持久化由 WorkspaceManager 负责）。"""
+        async with self._lock:
+            if workspace_id in self._sessions:
+                del self._sessions[workspace_id]
+            if workspace_id == self._active_workspace_id:
+                self._active_workspace_id = "default"
+
+    async def get_session(self) -> ClaudeSession | None:
+        """Deprecated: runtime keeps sessions per workspace."""
+        return None
+
+    async def get_workspace_session(self, workspace_id: str) -> ClaudeSession | None:
+        async with self._lock:
+            return self._sessions.get(workspace_id)
+
+    def get_last_tools(self, workspace_id: str) -> list[str] | None:
+        return self._last_init_tools.get(workspace_id)
+
+    async def probe_tools(self, *, workspace_id: str = "default") -> list[str]:
+        """独立探测 Claude Code 的工具列表（不与会话/聊天绑定）。"""
+        workspace = await self.workspace_manager.get_workspace(workspace_id)
+        if not workspace:
+            raise ClaudeCliError(
+                code=ErrorCode.WORKSPACE_NOT_FOUND,
+                message=f"Workspace not found: {workspace_id}",
+                retryable=False,
+                details={"workspace_id": workspace_id},
+                err_id=new_err_id(),
+            )
+
+        # 不使用 --resume，且禁用会话持久化，确保与“聊天会话”完全解耦
+        disallowed: set[str] = set(self.policy.blocked_tools)
+        if not self.policy.allow_command_execution:
+            disallowed.add("Bash")
+        if not self.policy.allow_file_modification:
+            disallowed.update({"Write", "Edit"})
+        if not self.policy.allow_network:
+            disallowed.update({"WebFetch", "WebSearch"})
+
+        # 关键点：不能依赖 --init-only。
+        # 实测该模式只输出终端控制序列，不会输出 stream-json 的 system.init（含 tools）。
+        # 因此必须使用 -p/--print 用一个极小 prompt 触发初始化，再从 system.init 提取工具列表。
+        claude_cmd: list[str] = [
+            "claude",
+            "-p",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--no-session-persistence",
+        ]
+        if self.skip_permissions:
+            claude_cmd.append("--dangerously-skip-permissions")
+        if self.policy.allowed_tools:
+            claude_cmd.extend(["--tools", ",".join(sorted(self.policy.allowed_tools))])
+        if disallowed:
+            claude_cmd.append("--disallowedTools")
+            claude_cmd.extend(sorted(disallowed))
+        # Prevent prompt from being parsed as an option
+        claude_cmd.append("--")
+        claude_cmd.append("ping")
+
+        cmd = self._build_pseudotty_wrapper_cmd(claude_cmd)
+        logger.debug(f"[ClaudeRuntime] Probe tools: {cmd!r} (cwd={workspace.path})")
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(workspace.path),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **self.env_overrides},
+        )
+
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+
+        tools: list[str] | None = None
+        parsed_objects = 0
+        stdout_tail: deque[str] = deque(maxlen=30)
+        stdout_skipped_tail: deque[str] = deque(maxlen=30)
+        line_stats: Counter[str] = Counter()
+
+        def _on_line(line: str, status: str) -> None:
+            line_stats[status] += 1
+            if status.startswith("yield:"):
+                if line:
+                    stdout_tail.append(line[:500])
+            elif status.startswith("skip"):
+                if line:
+                    stdout_skipped_tail.append(line[:500])
+
+        async for obj in self._iter_stream_json_objects(proc.stdout, on_line=_on_line):
+            parsed_objects += 1
+            if obj.get("type") == "system" and obj.get("subtype") == "init":
+                t = obj.get("tools")
+                if isinstance(t, list) and all(isinstance(x, str) for x in t):
+                    tools = list(t)
+                    # 拿到 tools 后立即结束：避免为了“探测工具”继续消耗 token
+                    break
+
+        # 若已获取 tools，尽快终止子进程（print 模式后续会继续生成响应文本）
+        if tools is not None and proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except TimeoutError:
+                proc.kill()
+                await proc.wait()
+
+        stderr_bytes = await proc.stderr.read()
+        _ = await proc.wait()
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+        if tools is None:
+            err_id = new_err_id()
+            logger.error(
+                "[ClaudeRuntime] Probe tools failed. "
+                f"err_id={err_id} parsed_objects={parsed_objects} exit={proc.returncode} "
+                f"stderr={stderr_text[:500]!r} line_stats={dict(line_stats)!r}"
+            )
+            raise ClaudeCliError(
+                code=ErrorCode.CLAUDE_CLI_NO_PARSEABLE_OUTPUT,
+                message="Claude produced no parseable init tools output",
+                retryable=True,
+                details={
+                    "parsed_objects": parsed_objects,
+                    "exit": proc.returncode,
+                    "stderr_preview": stderr_text[:500],
+                    "stdout_tail": list(stdout_tail),
+                    "stdout_skipped_tail": list(stdout_skipped_tail),
+                    "line_stats": dict(line_stats),
+                },
+                err_id=err_id,
+            )
+
+        self._last_init_tools[workspace_id] = tools
+        return tools

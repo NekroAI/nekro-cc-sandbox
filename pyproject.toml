@@ -1,0 +1,91 @@
+[project]
+name = "nekro-cc-sandbox"
+version = "0.1.0"
+description = "A Persistent Workspace Agent powered by Claude Code"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.10.0",
+    "python-multipart>=0.0.20",
+    "aiofiles>=24.0.0",
+    "watchfiles>=1.0.0",
+    "httpx>=0.28.1",
+    "loguru>=0.7.3",
+]
+
+[tool.uv]
+package = true
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=1.0.0",
+    "pytest-cov>=6.0.0",
+    "pytest-mock>=3.14.0",
+    "ruff>=0.8.0",
+    "pyright>=1.1.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+markers = [
+    "provider: real API provider tests (disabled by default; enable with --enable-provider-tests)",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.basedpyright]
+pythonVersion = "3.13"
+typeCheckingMode = "basic"
+
+[dependency-groups]
+dev = [
+    "poethepoet>=0.40.0",
+]
+
+[tool.poe.tasks]
+# Install all dependencies
+install = "uv sync"
+# Start development server
+dev = "uvicorn nekro_cc_sandbox.main:app --reload --host 0.0.0.0 --port 7021"
+# Run tests
+test = "pytest -v --tb=short"
+# Run linter
+lint = "ruff check ."
+# Run type checker
+typecheck = "pyright ."
+# Run all checks
+check = { cmd = "bash -c 'poe lint && poe typecheck && poe test'" }
+# Auto-fix linting issues
+lint-fix = "ruff check --fix src/ tests/"
+# Docker build
+docker-build = "docker build -t nekro-cc-sandbox ."
+# Docker run
+docker-run = "docker run -p 7021:7021 -v $(pwd)/workspaces:/home/appuser/workspaces nekro-cc-sandbox"
+# Frontend: install deps
+frontend-install = { cmd = "bash -c 'cd frontend && pnpm install'", help = "Install frontend dependencies" }
+# Frontend: dev
+frontend-dev = { cmd = "bash -c 'cd frontend && pnpm dev'", help = "Start frontend dev server" }
+# Frontend: build
+frontend-build = { cmd = "bash -c 'cd frontend && pnpm build'", help = "Build frontend for production" }
+# Frontend: type check
+frontend-typecheck = { cmd = "bash -c 'cd frontend && pnpm exec tsc --noEmit'", help = "Run TypeScript type checker" }
+# Frontend: lint
+frontend-lint = { cmd = "bash -c 'cd frontend && pnpm exec eslint src/ --ext ts,tsx --max-warnings 0'", help = "Run ESLint" }
+# Frontend: all checks
+frontend-check = { cmd = "bash -c 'cd frontend && pnpm exec tsc --noEmit && pnpm build'", help = "Run all frontend checks" }
+# Frontend: preview
+frontend-preview = { cmd = "bash -c 'cd frontend && pnpm preview'", help = "Preview production build" }

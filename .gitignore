@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+.coverage
+.pytest_cache
+.ruff_cache
+*.prof
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project specific
+workspaces/
+*.log
+logs/
+data/*.log
+.DS_Store
+
+# Node
+node_modules/
+dist/
+build/
+
+# Claude Code
+.claude/settings.local.json
+
+# Docker
+.docker/
+
+# Tmp
+tmp
