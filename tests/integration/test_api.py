@@ -5,34 +5,38 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from nekro_cc_sandbox.main import app
-
 # Global mock runtime for tests
 _mock_session = MagicMock()
 _mock_session.session_id = "test-session-123"
 
 _mock_runtime = MagicMock()
 _mock_runtime.start = AsyncMock(return_value=_mock_session)
-_mock_runtime.send_message = AsyncMock(return_value=iter(["test response"]))
+
+
+async def _fake_send_message_in_workspace(_workspace_id: str, _content: str):
+    yield "test response"
+
+
+_mock_runtime.send_message_in_workspace = _fake_send_message_in_workspace
 
 
 @pytest.fixture(autouse=True)
-def setup_mock_runtime():
+def setup_mock_runtime(test_app):
     """Setup mock runtime for all tests"""
-    app.state.claude_runtime = _mock_runtime
+    test_app.state.claude_runtime = _mock_runtime
     yield
     # Cleanup
-    if hasattr(app.state, 'claude_runtime'):
-        del app.state.claude_runtime
+    if hasattr(test_app.state, "claude_runtime"):
+        del test_app.state.claude_runtime
 
 
 class TestHealthEndpoint:
     """Tests for health check endpoint"""
 
     @pytest.fixture
-    def client(self):
+    def client(self, test_app):
         """Create test client"""
-        return TestClient(app)
+        return TestClient(test_app)
 
     def test_health_check(self, client):
         """Test health endpoint returns healthy status"""
@@ -48,9 +52,9 @@ class TestStatusEndpoint:
     """Tests for status endpoints"""
 
     @pytest.fixture
-    def client(self):
+    def client(self, test_app):
         """Create test client"""
-        return TestClient(app)
+        return TestClient(test_app)
 
     def test_get_status(self, client):
         """Test status endpoint"""
@@ -74,18 +78,18 @@ class TestMessagesEndpoint:
     """Tests for message endpoints"""
 
     @pytest.fixture
-    def client_with_runtime(self):
+    def client_with_runtime(self, test_app):
         """Create test client with mocked runtime"""
-        client = TestClient(app)
-        app.state.claude_runtime = _mock_runtime
+        client = TestClient(test_app)
+        test_app.state.claude_runtime = _mock_runtime
         return client
 
-    def test_send_message_no_runtime(self):
+    def test_send_message_no_runtime(self, test_app):
         """Test sending message when runtime is not available"""
-        client = TestClient(app)
+        client = TestClient(test_app)
         # Ensure no runtime is set
-        if hasattr(app.state, 'claude_runtime'):
-            del app.state.claude_runtime
+        if hasattr(test_app.state, "claude_runtime"):
+            del test_app.state.claude_runtime
         response = client.post(
             "/api/v1/message",
             json={

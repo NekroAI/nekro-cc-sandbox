@@ -338,6 +338,9 @@ class ClaudeRuntime:
                 yield last_assistant_text
                 return
 
+            if yielded_any_text:
+                return
+
             if not yielded_any_text:
                 # Stale/invalid resume id: retry once without --resume
                 if (

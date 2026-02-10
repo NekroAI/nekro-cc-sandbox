@@ -35,6 +35,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore:.*forkpty\\(\\) may lead to deadlocks.*:DeprecationWarning",
+]
 markers = [
     "provider: real API provider tests (disabled by default; enable with --enable-provider-tests)",
 ]

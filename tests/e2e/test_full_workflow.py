@@ -38,7 +38,13 @@ class TestCLIToolsAvailability:
 
     def test_claude_cli_available(self):
         """Check if Claude CLI is available"""
+        import os
         import shutil
+
+        import pytest
+
+        if os.getenv("REQUIRE_CLAUDE_CLI") != "1":
+            pytest.skip("Claude CLI not required in this environment (set REQUIRE_CLAUDE_CLI=1 to enforce).")
 
         assert shutil.which("claude") is not None, "Claude CLI not found in PATH"
 

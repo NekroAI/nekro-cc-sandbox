@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import tempfile
 from collections.abc import Generator
@@ -88,3 +89,105 @@ def mock_policy():
     from nekro_cc_sandbox.claude.policy import RuntimePolicy
 
     return RuntimePolicy.relaxed()
+
+
+@pytest.fixture
+def mock_claude_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Install a mock 'claude' CLI on PATH for runtime tests."""
+    from nekro_cc_sandbox.claude.runtime import ClaudeRuntime
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    script_path = bin_dir / "claude"
+
+    script_path.write_text(
+        """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+scenario = os.getenv("MOCK_CLAUDE_SCENARIO", "success")
+session_id = os.getenv("MOCK_CLAUDE_SESSION_ID", "11111111-1111-1111-1111-111111111111")
+
+def emit(obj):
+    print(json.dumps(obj), flush=True)
+
+resume_id = None
+if "--resume" in args:
+    idx = args.index("--resume")
+    if idx + 1 < len(args):
+        resume_id = args[idx + 1]
+
+prompt = ""
+if "--" in args:
+    idx = args.index("--")
+    if idx + 1 < len(args):
+        prompt = args[idx + 1]
+
+if scenario == "no-output":
+    sys.exit(0)
+
+if scenario == "error-result":
+    emit({
+        "type": "result",
+        "subtype": "error",
+        "is_error": True,
+        "errors": ["mock error"],
+        "result": "",
+    })
+    sys.exit(0)
+
+if scenario == "resume-miss-once" and resume_id:
+    emit({
+        "type": "result",
+        "subtype": "error",
+        "is_error": True,
+        "errors": [f"No conversation found with session ID: {resume_id}"],
+        "result": "",
+    })
+    sys.exit(0)
+
+if "--no-session-persistence" in args or prompt == "ping" or scenario == "probe-tools":
+    emit({"type": "system", "subtype": "init", "tools": ["Read", "Write", "Bash"]})
+    sys.exit(0)
+
+# Default: successful streaming response
+emit({"type": "system", "subtype": "init", "tools": ["Read", "Write", "Bash"]})
+
+if scenario == "result-only":
+    emit({
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "Hello world",
+        "session_id": session_id,
+    })
+    sys.exit(0)
+
+emit({
+    "type": "stream_event",
+    "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hello "}},
+})
+emit({
+    "type": "stream_event",
+    "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "world"}},
+})
+emit({
+    "type": "result",
+    "subtype": "success",
+    "is_error": False,
+    "result": "Hello world",
+    "session_id": session_id,
+})
+""",
+        encoding="utf-8",
+    )
+    script_path.chmod(0o755)
+
+    existing_path = os.environ.get("PATH", "")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{existing_path}")
+
+    # Avoid pseudo-tty wrapper in tests (some environments deny PTY allocation).
+    monkeypatch.setattr(ClaudeRuntime, "_build_pseudotty_wrapper_cmd", lambda _self, cmd: cmd)
+    return script_path
