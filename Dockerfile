@@ -84,11 +84,14 @@ RUN mkdir -p /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code
-RUN curl -fsSL https://claude.ai/install.sh | bash
+# Install Claude Code via npm (avoids bun install.sh which fails on arm64 without package.json)
+RUN npm install -g @anthropic-ai/claude-code
 
-# Make claude available on PATH for all users
-RUN if [ -x /root/.local/bin/claude ]; then cp /root/.local/bin/claude /usr/local/bin/claude; fi
+# Make claude available on PATH for all users (npm global bin is already in PATH,
+# but keep the fallback copy in case of non-standard install paths)
+RUN if [ ! -x /usr/local/bin/claude ] && [ -x /root/.local/bin/claude ]; then \
+        cp /root/.local/bin/claude /usr/local/bin/claude; \
+    fi
 
 # Set shared Playwright browsers path (accessible by all users)
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
