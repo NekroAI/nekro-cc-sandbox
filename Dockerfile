@@ -119,8 +119,11 @@ RUN uv sync --no-dev --frozen
 # Copy built frontend
 COPY --from=frontend-builder --chown=appuser:appuser /app/frontend/dist ./frontend/dist
 
-# Create workspace directory
-RUN mkdir -p /home/appuser/workspaces && chown -R appuser:appuser /home/appuser
+# Create workspace directory and pre-create .claude skill directories
+# (ensures appuser has write access even if root created .claude during build)
+RUN mkdir -p /home/appuser/workspaces \
+    && mkdir -p /home/appuser/.claude/skills/dynamic \
+    && chown -R appuser:appuser /home/appuser
 
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
