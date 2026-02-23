@@ -51,14 +51,37 @@ COPY --from=uv-bin /uv /usr/local/bin/uv
 ENV UV_SYSTEM_PYTHON=1
 ENV UV_LINK_MODE=copy
 
-# Install Claude Code and system dependencies
+# Install base system packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
+    build-essential \
     ca-certificates \
     curl \
+    gnupg \
     git \
+    jq \
+    openssh-client \
+    procps \
     unzip \
     util-linux \
+    wget \
+    zip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20.x
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI (gh)
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code
@@ -66,6 +89,16 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # Make claude available on PATH for all users
 RUN if [ -x /root/.local/bin/claude ]; then cp /root/.local/bin/claude /usr/local/bin/claude; fi
+
+# Set shared Playwright browsers path (accessible by all users)
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+
+# Install agent-browser globally and pre-cache Playwright Chromium to shared path
+RUN npm install -g agent-browser playwright \
+    && mkdir -p /opt/playwright-browsers \
+    && playwright install chromium \
+    && playwright install-deps chromium \
+    && chmod -R 755 /opt/playwright-browsers
 
 # Create non-root user
 RUN useradd -m -s /bin/bash appuser

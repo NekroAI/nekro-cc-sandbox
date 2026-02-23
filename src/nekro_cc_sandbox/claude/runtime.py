@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import time
 from collections import Counter, deque
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
@@ -16,6 +17,60 @@ from loguru import logger
 from ..errors import ClaudeCliError, ErrorCode, new_err_id
 from ..workspace import WorkspaceManager
 from .policy import RuntimePolicy
+
+
+@dataclass
+class WorkspaceTaskInfo:
+    """队列中或运行中的工作区任务信息"""
+    source_chat_key: str        # 发起任务的 NA 频道标识
+    prompt_preview: str         # 任务描述预览（前 80 字符）
+    enqueued_at: datetime       # 进入队列时间（含 tz）
+
+    started_at: datetime | None = None  # 开始执行时间（等待时为 None）
+
+    @property
+    def elapsed_seconds(self) -> float:
+        if self.started_at:
+            return (datetime.now(UTC) - self.started_at).total_seconds()
+        return 0.0
+
+    @property
+    def wait_seconds(self) -> float:
+        return (datetime.now(UTC) - self.enqueued_at).total_seconds()
+
+    def to_dict(self) -> dict:
+        return {
+            "source_chat_key": self.source_chat_key,
+            "prompt_preview": self.prompt_preview,
+            "enqueued_at": self.enqueued_at.isoformat(),
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "elapsed_seconds": round(self.elapsed_seconds, 1),
+            "wait_seconds": round(self.wait_seconds, 1),
+        }
+
+
+@dataclass
+class QueueWaitEvent:
+    """排队等待事件（send_message_in_workspace 在等待锁期间 yield 此对象）"""
+    position: int                        # 排队位置（1 = 下一个执行）
+    current_task: WorkspaceTaskInfo      # 当前正在执行的任务
+    queued_count: int                    # 总等待数（含自身）
+
+
+@dataclass
+class ToolCallEvent:
+    """Claude Code 工具调用事件"""
+    tool_use_id: str
+    name: str
+    input: dict[str, Any]
+
+
+@dataclass
+class ToolResultEvent:
+    """Claude Code 工具结果事件"""
+    tool_use_id: str
+    content: str
+    is_error: bool
 
 
 @dataclass
@@ -58,6 +113,13 @@ class ClaudeRuntime:
         self._active_workspace_id: str = "default"
         self._last_init_tools: dict[str, list[str]] = {}
 
+        # 工作区任务队列（per workspace）
+        self._workspace_locks: dict[str, asyncio.Lock] = {}
+        self._workspace_current_task: dict[str, WorkspaceTaskInfo | None] = {}
+        self._workspace_queued_tasks: dict[str, list[WorkspaceTaskInfo]] = {}
+        self._workspace_procs: dict[str, asyncio.subprocess.Process | None] = {}
+        self._workspace_force_cancelled: dict[str, bool] = {}
+
         # ANSI stripping (pseudo-tty wrapper may emit terminal controls)
         self._ansi_csi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
         self._ansi_osc = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
@@ -95,6 +157,30 @@ class ClaudeRuntime:
             )
             self._sessions[workspace_id] = session
             return session
+
+    def get_workspace_queue_status(self, workspace_id: str) -> dict:
+        """返回工作区当前任务队列状态。"""
+        current = self._workspace_current_task.get(workspace_id)
+        queued = self._workspace_queued_tasks.get(workspace_id, [])
+        return {
+            "workspace_id": workspace_id,
+            "current_task": current.to_dict() if current else None,
+            "queued_tasks": [t.to_dict() for t in queued],
+            "queue_length": len(queued),
+        }
+
+    async def force_cancel_workspace_task(self, workspace_id: str) -> bool:
+        """强制终止工作区当前正在运行的任务（kill 子进程）。"""
+        proc = self._workspace_procs.get(workspace_id)
+        if proc is not None and proc.returncode is None:
+            self._workspace_force_cancelled[workspace_id] = True
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            logger.info(f"[ClaudeRuntime] Force cancelled task for workspace={workspace_id}")
+            return True
+        return False
 
     def _build_claude_cmd(self, prompt: str, session_id: str | None) -> list[str]:
         disallowed: set[str] = set(self.policy.blocked_tools)
@@ -183,221 +269,339 @@ class ClaudeRuntime:
         """
         raise RuntimeError("send_message(message) must be called with workspace context")
 
-    async def send_message_in_workspace(self, workspace_id: str, message: str) -> AsyncGenerator[str]:
-        logger.info(f"[ClaudeRuntime] send_message({workspace_id}): {message[:120]}...")
-        session = await self.start(workspace_id)
-        workspace = await self.workspace_manager.get_workspace(workspace_id)
-        if not workspace:
-            raise ClaudeCliError(
-                code=ErrorCode.WORKSPACE_NOT_FOUND,
-                message=f"Workspace not found: {workspace_id}",
-                retryable=False,
-                details={"workspace_id": workspace_id},
-                err_id=new_err_id(),
-            )
+    async def send_message_in_workspace(self, workspace_id: str, message: str, source_chat_key: str = "", extra_env: dict[str, str] | None = None) -> AsyncGenerator[str | QueueWaitEvent | ToolCallEvent | ToolResultEvent]:
+        # ── 队列管理 ──────────────────────────────────────────────────────────
+        task_info = WorkspaceTaskInfo(
+            source_chat_key=source_chat_key,
+            prompt_preview=message[:80].replace("\n", " "),
+            enqueued_at=datetime.now(UTC),
+        )
+        queued_list = self._workspace_queued_tasks.setdefault(workspace_id, [])
+        queued_list.append(task_info)
+        lock = self._workspace_locks.setdefault(workspace_id, asyncio.Lock())
 
-        # Only pass --resume when we have a real UUID session id.
-        # Older versions of this project stored synthetic ids (e.g. "ws-default-...") which
-        # should not be used with Claude Code.
-        resume_id = session.session_id if (session.session_id and self._is_uuid(session.session_id)) else None
-
-        env = os.environ.copy()
-        env.update(self.env_overrides)
-
-        attempt_resume_id = resume_id
-        for attempt in range(2):
-            claude_cmd = self._build_claude_cmd(prompt=message, session_id=attempt_resume_id)
-            cmd = self._build_pseudotty_wrapper_cmd(claude_cmd)
-            logger.debug(f"[ClaudeRuntime] Exec(attempt={attempt}): {cmd!r} (cwd={workspace.path})")
-
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(workspace.path),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-
-            assert proc.stdout is not None
-            assert proc.stderr is not None
-
-            yielded_any_text = False
-            final_result_text: str | None = None
-            new_session_id: str | None = None
-            last_assistant_text: str | None = None
-            parsed_objects = 0
-            cli_error_summary: str | None = None
-            cli_errors: list[str] | None = None
-            cli_error_details: dict[str, Any] | None = None
-
-            stdout_tail: deque[str] = deque(maxlen=30)
-            stdout_skipped_tail: deque[str] = deque(maxlen=30)
-            line_stats: Counter[str] = Counter()
-            seen_types: Counter[str] = Counter()
-
-            def _on_line(line: str, status: str) -> None:
-                line_stats[status] += 1
-                if status.startswith("yield:"):
-                    if line:
-                        stdout_tail.append(line[:500])
-                elif status.startswith("skip"):
-                    if line:
-                        stdout_skipped_tail.append(line[:500])
-
-            async for obj in self._iter_stream_json_objects(proc.stdout, on_line=_on_line):
-                parsed_objects += 1
-                obj_type = obj.get("type")
-                if isinstance(obj_type, str):
-                    seen_types[obj_type] += 1
-                if obj_type == "stream_event":
-                    event = obj.get("event", {})
-                    if isinstance(event, dict) and event.get("type") == "content_block_delta":
-                        delta = event.get("delta", {})
-                        if isinstance(delta, dict) and delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            if isinstance(text, str) and text:
-                                yielded_any_text = True
-                                yield text
-                elif obj_type == "system" and obj.get("subtype") == "init":
-                    tools = obj.get("tools")
-                    if isinstance(tools, list) and all(isinstance(x, str) for x in tools):
-                        self._last_init_tools[workspace_id] = tools
-                elif obj_type == "assistant":
-                    # Fallback signal: some outputs may only appear as message snapshots.
-                    msg = obj.get("message", {})
-                    if isinstance(msg, dict):
-                        content = msg.get("content", [])
-                        if isinstance(content, list):
-                            text_parts: list[str] = []
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    t = block.get("text", "")
-                                    if isinstance(t, str) and t:
-                                        text_parts.append(t)
-                            if text_parts:
-                                last_assistant_text = "".join(text_parts)
-                elif obj_type == "result":
-                    subtype = obj.get("subtype")
-                    is_error = bool(obj.get("is_error")) or (
-                        isinstance(subtype, str) and subtype.startswith("error")
+        try:
+            # 若工作区已有任务在执行，yield 排队等待事件（每 3 秒一次）
+            while lock.locked():
+                current = self._workspace_current_task.get(workspace_id)
+                if current:
+                    try:
+                        pos = queued_list.index(task_info) + 1
+                    except ValueError:
+                        pos = 1
+                    yield QueueWaitEvent(
+                        position=pos,
+                        current_task=current,
+                        queued_count=len(queued_list),
                     )
+                await asyncio.sleep(3)
 
-                    # Capture final text if provided
-                    result_text = obj.get("result")
-                    if isinstance(result_text, str):
-                        final_result_text = result_text
+            # 取得锁后移入"运行中"
+            async with lock:
+                if task_info in queued_list:
+                    queued_list.remove(task_info)
+                task_info.started_at = datetime.now(UTC)
+                self._workspace_current_task[workspace_id] = task_info
+                self._workspace_force_cancelled[workspace_id] = False
 
-                    # Only persist session_id for successful results. Some error results return a fresh
-                    # UUID even though no conversation exists (e.g. "No conversation found...").
-                    sid = obj.get("session_id")
-                    if not is_error and isinstance(sid, str) and sid:
-                        new_session_id = sid
+                try:
+                    # ── 原有执行逻辑 ─────────────────────────────────────────
+                    msg_preview = message[:100].replace("\n", " ")
+                    logger.info(f"[ClaudeRuntime] ▶ Message recv (workspace={workspace_id}): {msg_preview!r}")
+                    start_time = time.monotonic()
+                    session = await self.start(workspace_id)
+                    workspace = await self.workspace_manager.get_workspace(workspace_id)
+                    if not workspace:
+                        raise ClaudeCliError(
+                            code=ErrorCode.WORKSPACE_NOT_FOUND,
+                            message=f"Workspace not found: {workspace_id}",
+                            retryable=False,
+                            details={"workspace_id": workspace_id},
+                            err_id=new_err_id(),
+                        )
 
-                    # Enrich error summary with `errors[]` if present
-                    errors_raw = obj.get("errors")
-                    if isinstance(errors_raw, list) and all(isinstance(x, str) for x in errors_raw):
-                        cli_errors = list(errors_raw)
+                    resume_id = session.session_id if (session.session_id and self._is_uuid(session.session_id)) else None
+                    env = os.environ.copy()
+                    env.update(self.env_overrides)
+                    if extra_env:
+                        env.update(extra_env)
+                    attempt_resume_id = resume_id
 
-                    if is_error:
-                        permission_denials = obj.get("permission_denials")
-                        pd_preview: list[Any] | None = None
-                        if isinstance(permission_denials, list):
-                            pd_preview = permission_denials[:3]
-                        # keep preview only; full list may be large
-                        preview: list[str] | None = None
-                        if cli_errors:
-                            preview = cli_errors[:3]
-                        cli_error_summary = "Claude CLI returned error result"
-                        cli_error_details = {
-                            "subtype": subtype,
-                            "permission_denials_preview": pd_preview if isinstance(permission_denials, list) else permission_denials,
-                            "errors_preview": preview if cli_errors else None,
-                        }
+                    for attempt in range(2):
+                        claude_cmd = self._build_claude_cmd(prompt=message, session_id=attempt_resume_id)
+                        cmd = self._build_pseudotty_wrapper_cmd(claude_cmd)
+                        logger.debug(f"[ClaudeRuntime] Exec(attempt={attempt}): {cmd!r} (cwd={workspace.path})")
 
-            # Ensure process is done and capture stderr for debugging
-            stderr_bytes = await proc.stderr.read()
-            _ = await proc.wait()
-            stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-            if proc.returncode not in (0, None) and stderr_text:
-                logger.warning(f"[ClaudeRuntime] Non-zero exit={proc.returncode}, stderr={stderr_text[:2000]}")
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            cwd=str(workspace.path),
+                            stdin=asyncio.subprocess.DEVNULL,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=env,
+                        )
+                        # 保存进程引用（供 force_cancel_workspace_task 使用）
+                        self._workspace_procs[workspace_id] = proc
 
-            # Persist updated session_id if present
-            if new_session_id and new_session_id != session.session_id:
-                session.session_id = new_session_id
-                await self.workspace_manager.update_session(workspace_id, new_session_id)
-                logger.info(f"[ClaudeRuntime] Updated session_id: {new_session_id}")
+                        assert proc.stdout is not None
+                        assert proc.stderr is not None
 
-            # Fallback: if we didn't get incremental deltas, yield the final result
-            if not yielded_any_text and final_result_text:
-                yield final_result_text
-                return
+                        yielded_any_text = False
+                        final_result_text: str | None = None
+                        new_session_id: str | None = None
+                        last_assistant_text: str | None = None
+                        parsed_objects = 0
+                        cli_error_summary: str | None = None
+                        cli_errors: list[str] | None = None
+                        cli_error_details: dict[str, Any] | None = None
+                        tool_calls_seen: list[str] = []
+                        yielded_tool_use_ids: set[str] = set()
+                        yielded_tool_result_ids: set[str] = set()
 
-            # Second fallback: no `result.result`, try assistant snapshot text
-            if not yielded_any_text and last_assistant_text:
-                yield last_assistant_text
-                return
+                        stdout_tail: deque[str] = deque(maxlen=30)
+                        stdout_skipped_tail: deque[str] = deque(maxlen=30)
+                        line_stats: Counter[str] = Counter()
+                        seen_types: Counter[str] = Counter()
 
-            if yielded_any_text:
-                return
+                        def _on_line(line: str, status: str) -> None:
+                            line_stats[status] += 1
+                            if status.startswith("yield:"):
+                                if line:
+                                    stdout_tail.append(line[:500])
+                            elif status.startswith("skip"):
+                                if line:
+                                    stdout_skipped_tail.append(line[:500])
 
-            if not yielded_any_text:
-                # Stale/invalid resume id: retry once without --resume
-                if (
-                    attempt == 0
-                    and attempt_resume_id
-                    and cli_errors
-                    and any("No conversation found with session ID" in e for e in cli_errors)
-                ):
-                    logger.warning(
-                        "[ClaudeRuntime] Resume session not found; retrying without --resume. "
-                        f"workspace_id={workspace_id} resume_id={attempt_resume_id!r}"
-                    )
-                    attempt_resume_id = None
-                    session.session_id = ""
-                    await self.workspace_manager.update_session(workspace_id, "")
-                    continue
+                        async for obj in self._iter_stream_json_objects(proc.stdout, on_line=_on_line):
+                            parsed_objects += 1
+                            obj_type = obj.get("type")
+                            if isinstance(obj_type, str):
+                                seen_types[obj_type] += 1
+                            if obj_type == "stream_event":
+                                event = obj.get("event", {})
+                                if isinstance(event, dict) and event.get("type") == "content_block_delta":
+                                    delta = event.get("delta", {})
+                                    if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                                        text = delta.get("text", "")
+                                        if isinstance(text, str) and text:
+                                            if not yielded_any_text:
+                                                elapsed_first = time.monotonic() - start_time
+                                                logger.info(
+                                                    f"[ClaudeRuntime] ◉ First chunk"
+                                                    f" (ttfb={elapsed_first:.1f}s workspace={workspace_id})"
+                                                )
+                                            yielded_any_text = True
+                                            yield text
+                            elif obj_type == "system" and obj.get("subtype") == "init":
+                                tools = obj.get("tools")
+                                if isinstance(tools, list) and all(isinstance(x, str) for x in tools):
+                                    self._last_init_tools[workspace_id] = tools
+                            elif obj_type == "assistant":
+                                msg = obj.get("message", {})
+                                if isinstance(msg, dict):
+                                    content = msg.get("content", [])
+                                    if isinstance(content, list):
+                                        text_parts: list[str] = []
+                                        for block in content:
+                                            if not isinstance(block, dict):
+                                                continue
+                                            btype = block.get("type")
+                                            if btype == "text":
+                                                t = block.get("text", "")
+                                                if isinstance(t, str) and t:
+                                                    text_parts.append(t)
+                                            elif btype == "tool_use":
+                                                tool_name = block.get("name", "?")
+                                                tool_use_id = block.get("id", "")
+                                                tool_input = block.get("input", {})
+                                                if tool_name not in tool_calls_seen:
+                                                    tool_calls_seen.append(tool_name)
+                                                if tool_use_id not in yielded_tool_use_ids:
+                                                    yielded_tool_use_ids.add(tool_use_id)
+                                                    logger.info(
+                                                        f"[ClaudeRuntime] ⚙ Tool call: {tool_name}"
+                                                        f" (workspace={workspace_id})"
+                                                    )
+                                                    yield ToolCallEvent(
+                                                        tool_use_id=tool_use_id,
+                                                        name=tool_name,
+                                                        input=tool_input if isinstance(tool_input, dict) else {},
+                                                    )
+                                        if text_parts:
+                                            last_assistant_text = "".join(text_parts)
+                            elif obj_type == "user":
+                                msg = obj.get("message", {})
+                                if isinstance(msg, dict):
+                                    content = msg.get("content", [])
+                                    if isinstance(content, list):
+                                        for block in content:
+                                            if not isinstance(block, dict):
+                                                continue
+                                            if block.get("type") == "tool_result":
+                                                tool_use_id = block.get("tool_use_id", "")
+                                                result_content = block.get("content", "")
+                                                is_error = bool(block.get("is_error", False))
+                                                if not isinstance(result_content, str):
+                                                    result_content = str(result_content)
+                                                if tool_use_id not in yielded_tool_result_ids:
+                                                    yielded_tool_result_ids.add(tool_use_id)
+                                                    yield ToolResultEvent(
+                                                        tool_use_id=tool_use_id,
+                                                        content=result_content,
+                                                        is_error=is_error,
+                                                    )
+                            elif obj_type == "result":
+                                subtype = obj.get("subtype")
+                                is_error = bool(obj.get("is_error")) or (
+                                    isinstance(subtype, str) and subtype.startswith("error")
+                                )
+                                result_text = obj.get("result")
+                                if isinstance(result_text, str):
+                                    final_result_text = result_text
+                                sid = obj.get("session_id")
+                                if not is_error and isinstance(sid, str) and sid:
+                                    new_session_id = sid
+                                usage = obj.get("usage") or {}
+                                in_tok = usage.get("input_tokens", "?")
+                                out_tok = usage.get("output_tokens", "?")
+                                if not is_error:
+                                    logger.info(
+                                        f"[ClaudeRuntime] ✦ Result: subtype={subtype!r} "
+                                        f"tokens(in={in_tok} out={out_tok})"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"[ClaudeRuntime] ✗ Result error: subtype={subtype!r} "
+                                        f"tokens(in={in_tok} out={out_tok})"
+                                    )
+                                errors_raw = obj.get("errors")
+                                if isinstance(errors_raw, list) and all(isinstance(x, str) for x in errors_raw):
+                                    cli_errors = list(errors_raw)
+                                if is_error:
+                                    permission_denials = obj.get("permission_denials")
+                                    pd_preview: list[Any] | None = None
+                                    if isinstance(permission_denials, list):
+                                        pd_preview = permission_denials[:3]
+                                    preview: list[str] | None = None
+                                    if cli_errors:
+                                        preview = cli_errors[:3]
+                                    cli_error_summary = "Claude CLI returned error result"
+                                    cli_error_details = {
+                                        "subtype": subtype,
+                                        "permission_denials_preview": pd_preview if isinstance(permission_denials, list) else permission_denials,
+                                        "errors_preview": preview if cli_errors else None,
+                                    }
 
-                if cli_error_summary:
-                    err_id = new_err_id()
-                    logger.error(f"[ClaudeRuntime] {cli_error_summary} err_id={err_id} details={cli_error_details!r}")
-                    raise ClaudeCliError(
-                        code=ErrorCode.CLAUDE_CLI_ERROR_RESULT,
-                        message=cli_error_summary,
-                        retryable=True,
-                        details=cli_error_details,
-                        err_id=err_id,
-                    )
+                        stderr_bytes = await proc.stderr.read()
+                        _ = await proc.wait()
+                        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+                        if proc.returncode not in (0, None) and stderr_text:
+                            logger.warning(f"[ClaudeRuntime] Non-zero exit={proc.returncode}, stderr={stderr_text[:2000]}")
 
-                logger.error(
-                    "[ClaudeRuntime] No parseable text output. "
-                    f"workspace_id={workspace_id} "
-                    f"resume_id={attempt_resume_id!r} "
-                    f"parsed_objects={parsed_objects} "
-                    f"seen_types={dict(seen_types)} "
-                    f"line_stats={dict(line_stats)} "
-                    f"exit={proc.returncode} "
-                    f"stderr={stderr_text[:500]!r} "
-                    f"stdout_tail={list(stdout_tail)!r} "
-                    f"stdout_skipped_tail={list(stdout_skipped_tail)!r}"
-                )
-                err_id = new_err_id()
-                logger.error(f"[ClaudeRuntime] err_id={err_id} code=CLAUDE_CLI_NO_PARSEABLE_OUTPUT workspace_id={workspace_id}")
-                raise ClaudeCliError(
-                    code=ErrorCode.CLAUDE_CLI_NO_PARSEABLE_OUTPUT,
-                    message="Claude produced no parseable text output",
-                    retryable=True,
-                    details={
-                        "workspace_id": workspace_id,
-                        "resume_id": attempt_resume_id,
-                        "parsed_objects": parsed_objects,
-                        "seen_types": dict(seen_types),
-                        "line_stats": dict(line_stats),
-                        "exit": proc.returncode,
-                        "stderr_preview": stderr_text[:500],
-                    },
-                    err_id=err_id,
-                )
+                        if new_session_id and new_session_id != session.session_id:
+                            session.session_id = new_session_id
+                            await self.workspace_manager.update_session(workspace_id, new_session_id)
+                            logger.info(f"[ClaudeRuntime] Updated session_id: {new_session_id}")
+
+                        elapsed = time.monotonic() - start_time
+                        tools_str = ", ".join(tool_calls_seen) if tool_calls_seen else "none"
+                        if yielded_any_text:
+                            chars: int | str = "streaming"
+                        elif final_result_text:
+                            chars = len(final_result_text)
+                        elif last_assistant_text:
+                            chars = len(last_assistant_text)
+                        else:
+                            chars = 0
+                        logger.info(
+                            f"[ClaudeRuntime] ✓ Exec done: elapsed={elapsed:.1f}s "
+                            f"tools=[{tools_str}] chars={chars} workspace={workspace_id}"
+                        )
+
+                        # 检查是否被强制取消
+                        if self._workspace_force_cancelled.get(workspace_id):
+                            raise ClaudeCliError(
+                                code=ErrorCode.TASK_CANCELLED,
+                                message="任务被强制取消",
+                                retryable=False,
+                                details={"workspace_id": workspace_id, "source_chat_key": source_chat_key},
+                                err_id=new_err_id(),
+                            )
+
+                        if not yielded_any_text and final_result_text:
+                            yield final_result_text
+                            return
+
+                        if not yielded_any_text and last_assistant_text:
+                            yield last_assistant_text
+                            return
+
+                        if yielded_any_text:
+                            return
+
+                        if not yielded_any_text:
+                            if (
+                                attempt == 0
+                                and attempt_resume_id
+                                and cli_errors
+                                and any("No conversation found with session ID" in e for e in cli_errors)
+                            ):
+                                logger.warning(
+                                    "[ClaudeRuntime] Resume session not found; retrying without --resume. "
+                                    f"workspace_id={workspace_id} resume_id={attempt_resume_id!r}"
+                                )
+                                attempt_resume_id = None
+                                session.session_id = ""
+                                await self.workspace_manager.update_session(workspace_id, "")
+                                continue
+
+                            if cli_error_summary:
+                                err_id = new_err_id()
+                                logger.error(f"[ClaudeRuntime] {cli_error_summary} err_id={err_id} details={cli_error_details!r}")
+                                raise ClaudeCliError(
+                                    code=ErrorCode.CLAUDE_CLI_ERROR_RESULT,
+                                    message=cli_error_summary,
+                                    retryable=True,
+                                    details=cli_error_details,
+                                    err_id=err_id,
+                                )
+
+                            logger.error(
+                                "[ClaudeRuntime] No parseable text output. "
+                                f"workspace_id={workspace_id} "
+                                f"resume_id={attempt_resume_id!r} "
+                                f"parsed_objects={parsed_objects} "
+                                f"seen_types={dict(seen_types)} "
+                                f"line_stats={dict(line_stats)} "
+                                f"exit={proc.returncode} "
+                                f"stderr={stderr_text[:500]!r} "
+                                f"stdout_tail={list(stdout_tail)!r} "
+                                f"stdout_skipped_tail={list(stdout_skipped_tail)!r}"
+                            )
+                            err_id = new_err_id()
+                            logger.error(f"[ClaudeRuntime] err_id={err_id} code=CLAUDE_CLI_NO_PARSEABLE_OUTPUT workspace_id={workspace_id}")
+                            raise ClaudeCliError(
+                                code=ErrorCode.CLAUDE_CLI_NO_PARSEABLE_OUTPUT,
+                                message="Claude produced no parseable text output",
+                                retryable=True,
+                                details={
+                                    "workspace_id": workspace_id,
+                                    "resume_id": attempt_resume_id,
+                                    "parsed_objects": parsed_objects,
+                                    "seen_types": dict(seen_types),
+                                    "line_stats": dict(line_stats),
+                                    "exit": proc.returncode,
+                                    "stderr_preview": stderr_text[:500],
+                                },
+                                err_id=err_id,
+                            )
+                    # ── 原有执行逻辑结束 ──────────────────────────────────────
+                finally:
+                    self._workspace_current_task[workspace_id] = None
+                    self._workspace_procs.pop(workspace_id, None)
+        finally:
+            if task_info in queued_list:
+                queued_list.remove(task_info)
 
     async def shutdown(self) -> None:
         """Shutdown runtime (no persistent subprocess)."""

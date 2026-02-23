@@ -1,5 +1,6 @@
 """FastAPI 入口：nekro-cc-sandbox。"""
 
+import logging
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -50,6 +51,9 @@ def setup_logging():
         level="INFO",
         format="{time:YYYY-MM-DD HH:mm:ss} [{level}] {message}",
     )
+
+    # 禁用 uvicorn 自带的 access log（由下方中间件接管，避免双重记录）
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 
 setup_logging()
@@ -163,13 +167,43 @@ app.add_middleware(
 )
 
 
+# 高频轮询路径（降为 DEBUG 级别，不产生 INFO 噪声）
+_SILENT_GET_PREFIXES = (
+    "/health",
+    "/api/v1/workspaces/",
+    "/api/v1/capabilities/tools",
+    "/api/v1/status",
+    "/api/v1/sessions",
+)
+
+
+def _is_silent_request(method: str, path: str) -> bool:
+    """判断是否为低价值轮询请求（应降级为 DEBUG）"""
+    if method != "GET":
+        return False
+    return path == "/health" or any(path.startswith(p) for p in _SILENT_GET_PREFIXES)
+
+
 # 请求日志中间件
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """记录所有请求"""
-    logger.info(f"→ {request.method} {request.url.path}")
+    """记录所有请求——写操作和有效 API 调用记 INFO，轮询/健康检查记 DEBUG"""
+    method = request.method
+    path = request.url.path
+    silent = _is_silent_request(method, path)
+
+    if not silent:
+        logger.info(f"→ {method} {path}")
+    else:
+        logger.debug(f"→ {method} {path}")
+
     response = await call_next(request)
-    logger.info(f"← {request.method} {request.url.path} - {response.status_code}")
+
+    if not silent or response.status_code >= 400:
+        logger.info(f"← {method} {path} - {response.status_code}")
+    else:
+        logger.debug(f"← {method} {path} - {response.status_code}")
+
     return response
 
 

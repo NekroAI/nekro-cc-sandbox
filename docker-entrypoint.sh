@@ -19,5 +19,5 @@ if ! runuser -u appuser -- test -w "${WORKSPACE_ROOT}" 2>/dev/null; then
   exit 1
 fi
 
-exec runuser -u appuser -- uv run python -m nekro_cc_sandbox.main
+exec runuser -u appuser -- uv run --no-dev --frozen python -m nekro_cc_sandbox.main
 

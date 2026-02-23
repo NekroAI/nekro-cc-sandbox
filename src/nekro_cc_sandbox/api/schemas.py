@@ -212,3 +212,22 @@ class ShellCreateResponse(BaseModel):
 
     id: str
 
+
+class WorkspaceTaskInfoSchema(BaseModel):
+    """工作区任务信息（用于队列状态展示）。"""
+
+    source_chat_key: str
+    prompt_preview: str
+    enqueued_at: str
+    started_at: str | None = None
+    elapsed_seconds: float
+    wait_seconds: float
+
+
+class WorkspaceQueueResponse(BaseModel):
+    """工作区任务队列状态响应。"""
+
+    workspace_id: str
+    current_task: WorkspaceTaskInfoSchema | None = None
+    queued_tasks: list[WorkspaceTaskInfoSchema] = Field(default_factory=list)
+    queue_length: int

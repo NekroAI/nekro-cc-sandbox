@@ -19,6 +19,8 @@ class MessageRequest(BaseModel):
     role: str = "user"
     content: str
     workspace_id: str = "default"
+    source_chat_key: str = ""
+    env_vars: dict[str, str] = {}
 
 
 class MessageResponse(BaseModel):
@@ -79,8 +81,11 @@ async def send_message(request: Request, body: MessageRequest) -> MessageRespons
 
         # Collect response chunks
         response_chunks = []
-        async for chunk in runtime.send_message_in_workspace(workspace_id, body.content):
-            response_chunks.append(chunk)
+        from ..claude.runtime import QueueWaitEvent
+        async for item in runtime.send_message_in_workspace(workspace_id, body.content, body.source_chat_key, extra_env=body.env_vars or None):
+            if isinstance(item, QueueWaitEvent):
+                continue  # 同步接口静默等待，不展示排队事件
+            response_chunks.append(item)
 
         # Parse the final response
         response_text = "".join(response_chunks)
@@ -166,9 +171,22 @@ async def send_message_stream(request: Request, body: MessageRequest):
             # Start runtime if not already running
             await runtime.start(workspace_id)
 
-            async for chunk in runtime.send_message_in_workspace(workspace_id, body.content):
-                # SSE data must be single-line; encode as JSON
-                yield f"data: {json.dumps({'type': 'chunk', 'chunk': chunk}, ensure_ascii=False)}\n\n"
+            from ..claude.runtime import QueueWaitEvent, ToolCallEvent, ToolResultEvent
+            async for item in runtime.send_message_in_workspace(workspace_id, body.content, body.source_chat_key, extra_env=body.env_vars or None):
+                if isinstance(item, QueueWaitEvent):
+                    queued_data = {
+                        "type": "queued",
+                        "position": item.position,
+                        "queued_count": item.queued_count,
+                        "current_task": item.current_task.to_dict(),
+                    }
+                    yield f"data: {json.dumps(queued_data, ensure_ascii=False)}\n\n"
+                elif isinstance(item, ToolCallEvent):
+                    yield f"data: {json.dumps({'type': 'tool_call', 'tool_use_id': item.tool_use_id, 'name': item.name, 'input': item.input}, ensure_ascii=False)}\n\n"
+                elif isinstance(item, ToolResultEvent):
+                    yield f"data: {json.dumps({'type': 'tool_result', 'tool_use_id': item.tool_use_id, 'content': item.content, 'is_error': item.is_error}, ensure_ascii=False)}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'chunk', 'chunk': item}, ensure_ascii=False)}\n\n"
         except AppError as e:
             err_id = e.err_id or new_err_id()
             logger.exception(f"[messages] /message/stream failed err_id={err_id} code={e.code} workspace_id={workspace_id}")
@@ -180,3 +198,36 @@ async def send_message_stream(request: Request, body: MessageRequest):
 
     from fastapi.responses import StreamingResponse
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.get("/workspaces/{workspace_id}/queue")
+async def get_workspace_queue(workspace_id: str, request: Request):
+    """获取工作区任务队列状态（当前任务 + 等待队列）。"""
+    from ..api.schemas import WorkspaceQueueResponse, WorkspaceTaskInfoSchema
+
+    runtime = getattr(request.app.state, "claude_runtime", None)
+    if runtime is None:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=503, content={"error": "runtime not available"})
+
+    status = runtime.get_workspace_queue_status(workspace_id)
+    current = status["current_task"]
+    queued = status["queued_tasks"]
+    return WorkspaceQueueResponse(
+        workspace_id=workspace_id,
+        current_task=WorkspaceTaskInfoSchema(**current) if current else None,
+        queued_tasks=[WorkspaceTaskInfoSchema(**t) for t in queued],
+        queue_length=status["queue_length"],
+    )
+
+
+@router.delete("/workspaces/{workspace_id}/queue/current")
+async def force_cancel_workspace_task(workspace_id: str, request: Request):
+    """强制取消工作区当前正在运行的任务。"""
+    runtime = getattr(request.app.state, "claude_runtime", None)
+    if runtime is None:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=503, content={"error": "runtime not available"})
+
+    cancelled = await runtime.force_cancel_workspace_task(workspace_id)
+    return {"cancelled": cancelled, "workspace_id": workspace_id}
