@@ -1,5 +1,8 @@
 """状态 API：用于监控工作区与运行时能力。"""
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
 from fastapi import APIRouter, HTTPException, Request
 
 from ..errors import AppError, ErrorCode, new_err_id
@@ -107,6 +110,13 @@ async def get_status(request: Request) -> StatusResponse:
                 allow_command_execution=bool(getattr(policy, "allow_command_execution", True)),
             )
 
+    try:
+        _version = _pkg_version("nekro-cc-sandbox")
+    except PackageNotFoundError:
+        _version = "unknown"
+
+    claude_version: str | None = getattr(request.app.state, "claude_code_version", None)
+
     return StatusResponse(
         services=ServicesInfo(
             claude_runtime="available" if runtime is not None else "unavailable",
@@ -119,7 +129,8 @@ async def get_status(request: Request) -> StatusResponse:
             count=len(workspaces),
             ids=[ws.id for ws in workspaces],
         ),
-        version="0.1.0",
+        version=_version,
+        claude_version=claude_version,
     )
 
 

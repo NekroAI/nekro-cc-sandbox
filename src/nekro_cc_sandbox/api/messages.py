@@ -1,5 +1,6 @@
 """消息 API：与 Claude Code 工作区进行交互。"""
 
+import asyncio
 import json
 from typing import Any
 
@@ -56,7 +57,6 @@ async def send_message(request: Request, body: MessageRequest) -> MessageRespons
 
     The sandbox forwards this message to Claude Code and streams the response.
     """
-    # Use request.app.state to access app-scoped state
     runtime = getattr(request.app.state, "claude_runtime", None)
     workspace_id = body.workspace_id or "default"
 
@@ -76,21 +76,16 @@ async def send_message(request: Request, body: MessageRequest) -> MessageRespons
         )
 
     try:
-        # Ensure runtime is started for the workspace
         session = await runtime.start(workspace_id)
-
-        # Collect response chunks
         response_chunks = []
         from ..claude.runtime import QueueWaitEvent
         async for item in runtime.send_message_in_workspace(workspace_id, body.content, body.source_chat_key, extra_env=body.env_vars or None):
             if isinstance(item, QueueWaitEvent):
-                continue  # 同步接口静默等待，不展示排队事件
+                continue
             response_chunks.append(item)
 
-        # Parse the final response
         response_text = "".join(response_chunks)
 
-        # 约束：空文本响应视为失败（避免“success=true 但 message 为空”的虚假成功）
         if not response_text.strip():
             err_id = new_err_id()
             logger.error(
@@ -110,91 +105,174 @@ async def send_message(request: Request, body: MessageRequest) -> MessageRespons
             )
 
         return MessageResponse(session_id=session.session_id, message=response_text, success=True)
+
     except AppError as e:
         err_id = e.err_id or new_err_id()
         logger.exception(f"[messages] /message failed err_id={err_id} code={e.code} workspace_id={workspace_id}")
-        sid = ""
-        maybe_session = locals().get("session")
-        if maybe_session is not None:
-            sid = getattr(maybe_session, "session_id", "") or ""
+        sid = getattr(locals().get("session"), "session_id", "") or ""
         return MessageResponse(
             session_id=sid,
             message=f"Error({err_id}): {e.message}",
             success=False,
-            error=_error_payload(
-                err_id=err_id,
-                code=e.code,
-                message=e.message,
-                retryable=e.retryable,
-                details=e.details,
-            ),
+            error=_error_payload(err_id=err_id, code=e.code, message=e.message, retryable=e.retryable, details=e.details),
         )
     except Exception as e:
         err_id = new_err_id()
         logger.exception(f"[messages] /message failed err_id={err_id} code=INTERNAL_ERROR workspace_id={workspace_id}")
-        sid = ""
-        maybe_session = locals().get("session")
-        if maybe_session is not None:
-            sid = getattr(maybe_session, "session_id", "") or ""
+        sid = getattr(locals().get("session"), "session_id", "") or ""
         return MessageResponse(
             session_id=sid,
             message=f"Error({err_id}): Internal error",
             success=False,
-            error=_error_payload(
-                err_id=err_id,
-                code=ErrorCode.INTERNAL_ERROR,
-                message=str(e),
-                retryable=True,
-            ),
+            error=_error_payload(err_id=err_id, code=ErrorCode.INTERNAL_ERROR, message=str(e), retryable=True),
         )
 
 
 @router.post("/message/stream")
 async def send_message_stream(request: Request, body: MessageRequest):
     """
-    Send a message and stream the response.
+    Send a message and stream the response (SSE).
 
-    Returns a Server-Sent Events (SSE) stream of Claude Code output.
+    容灾设计：CC 执行期间若客户端（NA）断开连接（如服务重启），CC 子进程仍会在后台
+    完成执行，结果暂存至 PendingResultStore（TTL 1 小时）。NA 重新上线后可通过
+    GET /api/v1/workspaces/{workspace_id}/pending-results 取回并推送到对应频道。
     """
-    # Use request.app.state to access app-scoped state
     runtime = getattr(request.app.state, "claude_runtime", None)
+    pending_store = getattr(request.app.state, "pending_store", None)
     workspace_id = body.workspace_id or "default"
+    source_chat_key = body.source_chat_key
 
-    async def event_generator():
+    # 无界队列在后台 CC Task 与 SSE 流之间传递事件；None 为结束哨兵
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    # CC Task 完成后等待客户端确认收到的信号
+    # event_generator 读到哨兵后设置；超时说明客户端已断开
+    client_received_all: asyncio.Event = asyncio.Event()
+
+    async def run_cc() -> None:
+        """在独立 asyncio.Task 中执行 CC，生命周期与 HTTP 连接解耦。"""
+        chunks: list[str] = []
+
         if runtime is None:
             err_id = new_err_id()
             logger.error(f"[messages] runtime missing err_id={err_id} workspace_id={workspace_id}")
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Error({err_id}): runtime not available', 'error': _error_payload(err_id=err_id, code=ErrorCode.RUNTIME_UNAVAILABLE, message='claude_runtime not initialized', retryable=True).model_dump()}, ensure_ascii=False)}\n\n"
+            await queue.put(json.dumps({
+                "type": "error",
+                "message": f"Error({err_id}): runtime not available",
+                "error": _error_payload(
+                    err_id=err_id,
+                    code=ErrorCode.RUNTIME_UNAVAILABLE,
+                    message="claude_runtime not initialized",
+                    retryable=True,
+                ).model_dump(),
+            }, ensure_ascii=False))
+            await queue.put(None)
             return
 
         try:
-            # Start runtime if not already running
             await runtime.start(workspace_id)
-
             from ..claude.runtime import QueueWaitEvent, ToolCallEvent, ToolResultEvent
-            async for item in runtime.send_message_in_workspace(workspace_id, body.content, body.source_chat_key, extra_env=body.env_vars or None):
+
+            async for item in runtime.send_message_in_workspace(
+                workspace_id,
+                body.content,
+                source_chat_key,
+                extra_env=body.env_vars or None,
+            ):
                 if isinstance(item, QueueWaitEvent):
-                    queued_data = {
+                    event_data = json.dumps({
                         "type": "queued",
                         "position": item.position,
                         "queued_count": item.queued_count,
                         "current_task": item.current_task.to_dict(),
-                    }
-                    yield f"data: {json.dumps(queued_data, ensure_ascii=False)}\n\n"
+                    }, ensure_ascii=False)
                 elif isinstance(item, ToolCallEvent):
-                    yield f"data: {json.dumps({'type': 'tool_call', 'tool_use_id': item.tool_use_id, 'name': item.name, 'input': item.input}, ensure_ascii=False)}\n\n"
+                    event_data = json.dumps({
+                        "type": "tool_call",
+                        "tool_use_id": item.tool_use_id,
+                        "name": item.name,
+                        "input": item.input,
+                    }, ensure_ascii=False)
                 elif isinstance(item, ToolResultEvent):
-                    yield f"data: {json.dumps({'type': 'tool_result', 'tool_use_id': item.tool_use_id, 'content': item.content, 'is_error': item.is_error}, ensure_ascii=False)}\n\n"
+                    event_data = json.dumps({
+                        "type": "tool_result",
+                        "tool_use_id": item.tool_use_id,
+                        "content": item.content,
+                        "is_error": item.is_error,
+                    }, ensure_ascii=False)
                 else:
-                    yield f"data: {json.dumps({'type': 'chunk', 'chunk': item}, ensure_ascii=False)}\n\n"
+                    # 文本 chunk：累积以备暂存，同时推入队列
+                    chunks.append(item)
+                    event_data = json.dumps({"type": "chunk", "chunk": item}, ensure_ascii=False)
+
+                await queue.put(event_data)
+
         except AppError as e:
             err_id = e.err_id or new_err_id()
-            logger.exception(f"[messages] /message/stream failed err_id={err_id} code={e.code} workspace_id={workspace_id}")
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Error({err_id}): {e.message}', 'error': _error_payload(err_id=err_id, code=e.code, message=e.message, retryable=e.retryable, details=e.details).model_dump()}, ensure_ascii=False)}\n\n"
+            logger.exception(
+                f"[messages] stream CC task AppError err_id={err_id} code={e.code} workspace={workspace_id}"
+            )
+            await queue.put(json.dumps({
+                "type": "error",
+                "message": f"Error({err_id}): {e.message}",
+                "error": _error_payload(
+                    err_id=err_id, code=e.code, message=e.message,
+                    retryable=e.retryable, details=e.details,
+                ).model_dump(),
+            }, ensure_ascii=False))
+
         except Exception as e:
             err_id = new_err_id()
-            logger.exception(f"[messages] /message/stream failed err_id={err_id} code=INTERNAL_ERROR workspace_id={workspace_id}")
-            yield f"data: {json.dumps({'type': 'error', 'message': f'Error({err_id}): Internal error', 'error': _error_payload(err_id=err_id, code=ErrorCode.INTERNAL_ERROR, message=str(e), retryable=True).model_dump()}, ensure_ascii=False)}\n\n"
+            logger.exception(
+                f"[messages] stream CC task Exception err_id={err_id} workspace={workspace_id}"
+            )
+            await queue.put(json.dumps({
+                "type": "error",
+                "message": f"Error({err_id}): Internal error",
+                "error": _error_payload(
+                    err_id=err_id, code=ErrorCode.INTERNAL_ERROR, message=str(e), retryable=True,
+                ).model_dump(),
+            }, ensure_ascii=False))
+
+        finally:
+            # 放入哨兵，通知 event_generator CC 已结束
+            await queue.put(None)
+
+        # 等待客户端确认收到（最多 5 秒）
+        # 若超时说明客户端在流完成前已断开，将结果暂存供 NA 重启后恢复
+        try:
+            await asyncio.wait_for(client_received_all.wait(), timeout=5.0)
+        except TimeoutError:
+            full_result = "".join(chunks)
+            if full_result.strip() and source_chat_key and pending_store is not None:
+                pending_store.add(workspace_id, source_chat_key, full_result)
+                logger.warning(
+                    f"[messages] 客户端已断开，CC 结果已暂存: "
+                    f"workspace={workspace_id!r} source_chat_key={source_chat_key!r} "
+                    f"chars={len(full_result)}"
+                )
+            else:
+                logger.debug(
+                    f"[messages] 客户端断开但无需暂存（无结果或无 chat_key）: "
+                    f"workspace={workspace_id!r} has_result={bool(chunks)} "
+                    f"has_chat_key={bool(source_chat_key)}"
+                )
+
+    # 独立 Task：不受 HTTP 请求取消的影响
+    asyncio.create_task(run_cc())
+
+    async def event_generator():
+        try:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    # 哨兵：通知 run_cc 任务数据已全部投递
+                    client_received_all.set()
+                    return
+                yield f"data: {item}\n\n"
+        except (asyncio.CancelledError, GeneratorExit):
+            # 客户端断开：不设置 client_received_all，让 run_cc 超时后暂存结果
+            raise
 
     from fastapi.responses import StreamingResponse
     return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -231,3 +309,34 @@ async def force_cancel_workspace_task(workspace_id: str, request: Request):
 
     cancelled = await runtime.force_cancel_workspace_task(workspace_id)
     return {"cancelled": cancelled, "workspace_id": workspace_id}
+
+
+@router.get("/workspaces/{workspace_id}/pending-results")
+async def get_pending_results(workspace_id: str, request: Request):
+    """取出并消费指定工作区的所有待投递结果（读后即删）。
+
+    NA 重启后调用此接口获取 CC 在断线期间完成的任务结果，
+    再投递到对应聊天频道触发 Agent 响应，实现无感重启。
+    """
+    from ..api.schemas import PendingResultItem, PendingResultsResponse
+
+    pending_store = getattr(request.app.state, "pending_store", None)
+    if pending_store is None:
+        return PendingResultsResponse(workspace_id=workspace_id, results=[], count=0)
+
+    results = pending_store.pop_all(workspace_id)
+    return PendingResultsResponse(
+        workspace_id=workspace_id,
+        results=[
+            PendingResultItem(
+                id=r.id,
+                workspace_id=r.workspace_id,
+                source_chat_key=r.source_chat_key,
+                result=r.result,
+                created_at=r.created_at.isoformat(),
+                expires_at=r.expires_at.isoformat(),
+            )
+            for r in results
+        ],
+        count=len(results),
+    )

@@ -1,9 +1,12 @@
 """FastAPI 入口：nekro-cc-sandbox。"""
 
+import asyncio
 import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -19,7 +22,29 @@ from .enums import RuntimePolicyMode
 from .errors import AppError, ErrorCode, new_err_id
 from .settings import Settings
 from .shell import ShellManager
+from .store import PendingResultStore
 from .workspace import WorkspaceManager
+
+try:
+    _APP_VERSION = _pkg_version("nekro-cc-sandbox")
+except PackageNotFoundError:
+    _APP_VERSION = "unknown"
+
+
+async def _probe_claude_version() -> str | None:
+    """探测容器内 Claude Code CLI 版本，仅在启动时运行一次并缓存。"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        output = stdout.decode().strip()
+        return output or None
+    except Exception as e:
+        logger.warning(f"[startup] 无法获取 Claude Code 版本: {e}")
+        return None
 
 # 日志配置
 LOG_DIR = Path("./data/logs")
@@ -101,12 +126,24 @@ async def lifespan(app: FastAPI):
     # Interactive shell manager (PTY-backed)
     app.state.shell_manager = ShellManager()
 
+    # 待投递结果暂存（NA 断线时 CC 结果的容灾暂存）
+    app.state.pending_store = PendingResultStore()
+    app.state.pending_store.start_cleanup_task()
+
+    # 探测并缓存 Claude Code CLI 版本（镜像内固定，启动时探测一次即可）
+    app.state.claude_code_version = await _probe_claude_version()
+    if app.state.claude_code_version:
+        logger.info(f"Claude Code version: {app.state.claude_code_version}")
+    else:
+        logger.warning("Claude Code version could not be determined")
+
     logger.success("nekro-cc-sandbox started successfully")
 
     yield
 
     # Shutdown
     logger.info("Shutting down nekro-cc-sandbox...")
+    app.state.pending_store.stop_cleanup_task()
     await app.state.shell_manager.close_all()
     await app.state.claude_runtime.shutdown()
     logger.success("Shutdown complete")
@@ -116,7 +153,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="nekro-cc-sandbox",
     description="A Persistent Workspace Agent powered by Claude Code",
-    version="0.1.0",
+    version=_APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -218,7 +255,7 @@ app.include_router(shells_router, prefix="/api/v1")
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
     """健康检查接口。"""
-    return HealthResponse(version="0.1.0")
+    return HealthResponse(version=_APP_VERSION)
 
 
 # Mount frontend if exists (catch-all route must be last)

@@ -110,6 +110,7 @@ class StatusResponse(BaseModel):
     capabilities: CapabilitiesInfo
     workspaces: WorkspacesSummary
     version: str
+    claude_version: str | None = None
 
 
 class SessionInfo(BaseModel):
@@ -231,3 +232,22 @@ class WorkspaceQueueResponse(BaseModel):
     current_task: WorkspaceTaskInfoSchema | None = None
     queued_tasks: list[WorkspaceTaskInfoSchema] = Field(default_factory=list)
     queue_length: int
+
+
+class PendingResultItem(BaseModel):
+    """单条待投递结果。"""
+
+    id: str
+    workspace_id: str
+    source_chat_key: str
+    result: str
+    created_at: str
+    expires_at: str
+
+
+class PendingResultsResponse(BaseModel):
+    """待投递结果列表响应（消费语义：返回后即从暂存区移除）。"""
+
+    workspace_id: str
+    results: list[PendingResultItem] = Field(default_factory=list)
+    count: int

@@ -239,7 +239,7 @@ wheels = [
 
 [[package]]
 name = "nekro-cc-sandbox"
-version = "0.1.0"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
@@ -264,13 +264,13 @@ dev = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "poethepoet" },
     { name = "pyright" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "pytest-mock" },
     { name = "ruff" },
-    { name = "poethepoet" },
 ]
 
 [package.metadata]
@@ -294,13 +294,13 @@ provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "poethepoet", specifier = ">=0.40.0" },
     { name = "pyright", specifier = ">=1.1.0" },
     { name = "pytest", specifier = ">=8.3.0" },
     { name = "pytest-asyncio", specifier = ">=1.0.0" },
     { name = "pytest-cov", specifier = ">=6.0.0" },
     { name = "pytest-mock", specifier = ">=3.14.0" },
     { name = "ruff", specifier = ">=0.8.0" },
-    { name = "poethepoet", specifier = ">=0.40.0" },
 ]
 
 [[package]]
