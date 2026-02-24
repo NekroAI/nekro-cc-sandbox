@@ -100,11 +100,8 @@ async def lifespan(app: FastAPI):
     settings_path = Path(os.getenv("SETTINGS_PATH", "./data/settings.json"))
     app.state.settings = Settings.load(settings_path)
 
-    # Get env overrides from settings
-    env_overrides = app.state.settings.get_env_vars()
-
     # Initialize Claude Code runtime
-    # 产品默认：对外提供“非交互自动运行”的沙盒 agent
+    # 产品默认：对外提供"非交互自动运行"的沙盒 agent
     policy_mode_raw = os.getenv("RUNTIME_POLICY", RuntimePolicyMode.AGENT.value).lower().strip()
     if policy_mode_raw == RuntimePolicyMode.STRICT.value:
         policy = RuntimePolicy.strict()
@@ -119,7 +116,7 @@ async def lifespan(app: FastAPI):
     app.state.claude_runtime = ClaudeRuntime(
         workspace_manager=app.state.workspace_manager,
         skip_permissions=os.getenv("SKIP_PERMISSIONS", "false").lower() == "true",
-        env_overrides=env_overrides,
+        settings_path=settings_path,  # 动态读取，支持 NA 侧热更新模型预设
         policy=policy,
     )
 

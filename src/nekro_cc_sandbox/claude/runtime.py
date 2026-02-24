@@ -10,11 +10,13 @@ from collections import Counter, deque
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 from ..errors import ClaudeCliError, ErrorCode, new_err_id
+from ..settings import Settings
 from ..workspace import WorkspaceManager
 from .policy import RuntimePolicy
 
@@ -103,10 +105,12 @@ class ClaudeRuntime:
         skip_permissions: bool = True,
         env_overrides: dict[str, str] | None = None,
         policy: RuntimePolicy | None = None,
+        settings_path: Path | None = None,
     ) -> None:
         self.workspace_manager: WorkspaceManager = workspace_manager
         self.skip_permissions: bool = skip_permissions
-        self.env_overrides: dict[str, str] = env_overrides or {}
+        self._static_env_overrides: dict[str, str] = env_overrides or {}
+        self._settings_path: Path | None = settings_path
         self.policy: RuntimePolicy = policy or RuntimePolicy.relaxed()
         self._lock: asyncio.Lock = asyncio.Lock()
         self._sessions: dict[str, ClaudeSession] = {}
@@ -123,6 +127,15 @@ class ClaudeRuntime:
         # ANSI stripping (pseudo-tty wrapper may emit terminal controls)
         self._ansi_csi = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
         self._ansi_osc = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+
+    def _get_env_overrides(self) -> dict[str, str]:
+        """每次 spawn 时动态读取 settings.json，支持 NA 侧热更新模型预设而无需重启容器。"""
+        if self._settings_path is not None:
+            try:
+                return Settings.load(self._settings_path).get_env_vars()
+            except Exception as e:
+                logger.warning(f"[ClaudeRuntime] 读取 settings.json 失败，使用静态配置: {e}")
+        return self._static_env_overrides
 
     def _strip_ansi_and_controls(self, text: str) -> str:
         stripped = self._ansi_csi.sub("", text)
@@ -322,7 +335,7 @@ class ClaudeRuntime:
 
                     resume_id = session.session_id if (session.session_id and self._is_uuid(session.session_id)) else None
                     env = os.environ.copy()
-                    env.update(self.env_overrides)
+                    env.update(self._get_env_overrides())
                     if extra_env:
                         env.update(extra_env)
                     attempt_resume_id = resume_id
@@ -681,7 +694,7 @@ class ClaudeRuntime:
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, **self.env_overrides},
+            env={**os.environ, **self._get_env_overrides()},
         )
 
         assert proc.stdout is not None
