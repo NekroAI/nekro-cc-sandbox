@@ -243,6 +243,8 @@ class PendingResultItem(BaseModel):
     result: str
     created_at: str
     expires_at: str
+    is_error: bool = False
+    error_code: str = ""
 
 
 class PendingResultsResponse(BaseModel):

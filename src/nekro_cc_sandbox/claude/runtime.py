@@ -185,14 +185,28 @@ class ClaudeRuntime:
     async def force_cancel_workspace_task(self, workspace_id: str) -> bool:
         """强制终止工作区当前正在运行的任务（kill 子进程）。"""
         proc = self._workspace_procs.get(workspace_id)
+        current_task = self._workspace_current_task.get(workspace_id)
         if proc is not None and proc.returncode is None:
             self._workspace_force_cancelled[workspace_id] = True
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
-            logger.info(f"[ClaudeRuntime] Force cancelled task for workspace={workspace_id}")
+            task_desc = ""
+            if current_task:
+                task_desc = (
+                    f" source_chat_key={current_task.source_chat_key!r}"
+                    f" elapsed={current_task.elapsed_seconds:.1f}s"
+                )
+            logger.warning(
+                f"[ClaudeRuntime] ✂ Force cancelled task:"
+                f" workspace={workspace_id} pid={proc.pid}{task_desc}"
+            )
             return True
+        logger.debug(
+            f"[ClaudeRuntime] Force cancel requested but no running task:"
+            f" workspace={workspace_id} has_proc={proc is not None}"
+        )
         return False
 
     def _build_claude_cmd(self, prompt: str, session_id: str | None) -> list[str]:
@@ -335,9 +349,20 @@ class ClaudeRuntime:
 
                     resume_id = session.session_id if (session.session_id and self._is_uuid(session.session_id)) else None
                     env = os.environ.copy()
-                    env.update(self._get_env_overrides())
+                    env_overrides = self._get_env_overrides()
+                    env.update(env_overrides)
                     if extra_env:
                         env.update(extra_env)
+                    # 记录本次执行使用的关键配置（脱敏）
+                    _model = env_overrides.get("ANTHROPIC_MODEL", "<default>")
+                    _base_url = env_overrides.get("ANTHROPIC_BASE_URL", "<default>")
+                    _timeout = env_overrides.get("API_TIMEOUT_MS", "<default>")
+                    _has_token = bool(env_overrides.get("ANTHROPIC_AUTH_TOKEN"))
+                    logger.info(
+                        f"[ClaudeRuntime] ⚑ Config: model={_model!r} base_url={_base_url!r} "
+                        f"timeout_ms={_timeout} has_token={_has_token} "
+                        f"resume_id={resume_id!r} workspace={workspace_id}"
+                    )
                     attempt_resume_id = resume_id
 
                     for attempt in range(2):
@@ -480,12 +505,16 @@ class ClaudeRuntime:
                                 if not is_error:
                                     logger.info(
                                         f"[ClaudeRuntime] ✦ Result: subtype={subtype!r} "
-                                        f"tokens(in={in_tok} out={out_tok})"
+                                        f"tokens(in={in_tok} out={out_tok}) "
+                                        f"workspace={workspace_id}"
                                     )
                                 else:
+                                    result_preview = (result_text[:200] + "...") if isinstance(result_text, str) and len(result_text) > 200 else result_text
                                     logger.warning(
                                         f"[ClaudeRuntime] ✗ Result error: subtype={subtype!r} "
-                                        f"tokens(in={in_tok} out={out_tok})"
+                                        f"tokens(in={in_tok} out={out_tok}) "
+                                        f"workspace={workspace_id} "
+                                        f"result_preview={result_preview!r}"
                                     )
                                 errors_raw = obj.get("errors")
                                 if isinstance(errors_raw, list) and all(isinstance(x, str) for x in errors_raw):
@@ -508,8 +537,17 @@ class ClaudeRuntime:
                         stderr_bytes = await proc.stderr.read()
                         _ = await proc.wait()
                         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-                        if proc.returncode not in (0, None) and stderr_text:
-                            logger.warning(f"[ClaudeRuntime] Non-zero exit={proc.returncode}, stderr={stderr_text[:2000]}")
+                        if proc.returncode not in (0, None):
+                            logger.warning(
+                                f"[ClaudeRuntime] Non-zero exit={proc.returncode} "
+                                f"workspace={workspace_id} "
+                                f"stderr={stderr_text[:2000]!r}"
+                            )
+                        elif stderr_text:
+                            logger.debug(
+                                f"[ClaudeRuntime] Process exit=0 stderr={stderr_text[:500]!r} "
+                                f"workspace={workspace_id}"
+                            )
 
                         if new_session_id and new_session_id != session.session_id:
                             session.session_id = new_session_id
@@ -526,9 +564,14 @@ class ClaudeRuntime:
                             chars = len(last_assistant_text)
                         else:
                             chars = 0
+                        _error_flag = f" ERROR={cli_error_summary!r}" if cli_error_summary else ""
                         logger.info(
                             f"[ClaudeRuntime] ✓ Exec done: elapsed={elapsed:.1f}s "
-                            f"tools=[{tools_str}] chars={chars} workspace={workspace_id}"
+                            f"exit={proc.returncode} "
+                            f"tools=[{tools_str}] chars={chars} "
+                            f"parsed_objs={parsed_objects} "
+                            f"seen_types={dict(seen_types)} "
+                            f"workspace={workspace_id}{_error_flag}"
                         )
 
                         # 检查是否被强制取消
@@ -541,7 +584,7 @@ class ClaudeRuntime:
                                 err_id=new_err_id(),
                             )
 
-                        if not yielded_any_text and final_result_text:
+                        if not yielded_any_text and final_result_text and not cli_error_summary:
                             yield final_result_text
                             return
 

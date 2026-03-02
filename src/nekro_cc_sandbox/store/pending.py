@@ -31,6 +31,8 @@ class PendingResult:
     result: str
     created_at: datetime
     expires_at: datetime
+    is_error: bool = False
+    error_code: str = ""
 
     def is_expired(self) -> bool:
         return datetime.now(UTC) >= self.expires_at
@@ -43,6 +45,8 @@ class PendingResult:
             "result": self.result,
             "created_at": self.created_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
+            "is_error": self.is_error,
+            "error_code": self.error_code,
         }
 
 
@@ -75,6 +79,9 @@ class PendingResultStore:
         source_chat_key: str,
         result: str,
         ttl_seconds: int = 3600,
+        *,
+        is_error: bool = False,
+        error_code: str = "",
     ) -> PendingResult:
         """新增一条待投递结果。同一 (workspace_id, source_chat_key) 会覆盖旧值。"""
         now = datetime.now(UTC)
@@ -85,6 +92,8 @@ class PendingResultStore:
             result=result,
             created_at=now,
             expires_at=now + timedelta(seconds=ttl_seconds),
+            is_error=is_error,
+            error_code=error_code,
         )
         bucket = self._store.setdefault(workspace_id, [])
         # 覆盖同 source_chat_key 的旧条目（避免重复推送）

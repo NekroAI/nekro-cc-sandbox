@@ -152,6 +152,14 @@ async def send_message_stream(request: Request, body: MessageRequest):
     async def run_cc() -> None:
         """在独立 asyncio.Task 中执行 CC，生命周期与 HTTP 连接解耦。"""
         chunks: list[str] = []
+        error_message: str = ""
+        error_code: str = ""
+
+        logger.info(
+            f"[messages] SSE stream started: workspace={workspace_id!r} "
+            f"source_chat_key={source_chat_key!r} "
+            f"content_len={len(body.content)}"
+        )
 
         if runtime is None:
             err_id = new_err_id()
@@ -212,9 +220,11 @@ async def send_message_stream(request: Request, body: MessageRequest):
             logger.exception(
                 f"[messages] stream CC task AppError err_id={err_id} code={e.code} workspace={workspace_id}"
             )
+            error_message = f"Error({err_id}): {e.message}"
+            error_code = str(e.code.value) if hasattr(e.code, "value") else str(e.code)
             await queue.put(json.dumps({
                 "type": "error",
-                "message": f"Error({err_id}): {e.message}",
+                "message": error_message,
                 "error": _error_payload(
                     err_id=err_id, code=e.code, message=e.message,
                     retryable=e.retryable, details=e.details,
@@ -226,9 +236,11 @@ async def send_message_stream(request: Request, body: MessageRequest):
             logger.exception(
                 f"[messages] stream CC task Exception err_id={err_id} workspace={workspace_id}"
             )
+            error_message = f"Error({err_id}): Internal error"
+            error_code = str(ErrorCode.INTERNAL_ERROR.value) if hasattr(ErrorCode.INTERNAL_ERROR, "value") else str(ErrorCode.INTERNAL_ERROR)
             await queue.put(json.dumps({
                 "type": "error",
-                "message": f"Error({err_id}): Internal error",
+                "message": error_message,
                 "error": _error_payload(
                     err_id=err_id, code=ErrorCode.INTERNAL_ERROR, message=str(e), retryable=True,
                 ).model_dump(),
@@ -237,6 +249,13 @@ async def send_message_stream(request: Request, body: MessageRequest):
         finally:
             # 放入哨兵，通知 event_generator CC 已结束
             await queue.put(None)
+            total_chars = sum(len(c) for c in chunks)
+            logger.info(
+                f"[messages] SSE CC task finished: workspace={workspace_id!r} "
+                f"source_chat_key={source_chat_key!r} "
+                f"chunks={len(chunks)} total_chars={total_chars} "
+                f"has_error={bool(error_message)}"
+            )
 
         # 等待客户端确认收到（最多 5 秒）
         # 若超时说明客户端在流完成前已断开，将结果暂存供 NA 重启后恢复
@@ -244,12 +263,24 @@ async def send_message_stream(request: Request, body: MessageRequest):
             await asyncio.wait_for(client_received_all.wait(), timeout=5.0)
         except TimeoutError:
             full_result = "".join(chunks)
+            # 正常结果暂存
             if full_result.strip() and source_chat_key and pending_store is not None:
                 pending_store.add(workspace_id, source_chat_key, full_result)
                 logger.warning(
                     f"[messages] 客户端已断开，CC 结果已暂存: "
                     f"workspace={workspace_id!r} source_chat_key={source_chat_key!r} "
                     f"chars={len(full_result)}"
+                )
+            # 错误结果也暂存（标记 is_error），让 NA Watcher 能感知到错误
+            elif error_message and source_chat_key and pending_store is not None:
+                pending_store.add(
+                    workspace_id, source_chat_key, error_message,
+                    is_error=True, error_code=error_code,
+                )
+                logger.warning(
+                    f"[messages] 客户端已断开，CC 错误已暂存: "
+                    f"workspace={workspace_id!r} source_chat_key={source_chat_key!r} "
+                    f"error_code={error_code!r}"
                 )
             else:
                 logger.debug(
@@ -272,6 +303,10 @@ async def send_message_stream(request: Request, body: MessageRequest):
                 yield f"data: {item}\n\n"
         except (asyncio.CancelledError, GeneratorExit):
             # 客户端断开：不设置 client_received_all，让 run_cc 超时后暂存结果
+            logger.warning(
+                f"[messages] SSE client disconnected: workspace={workspace_id!r} "
+                f"source_chat_key={source_chat_key!r}"
+            )
             raise
 
     from fastapi.responses import StreamingResponse
@@ -335,6 +370,8 @@ async def get_pending_results(workspace_id: str, request: Request):
                 result=r.result,
                 created_at=r.created_at.isoformat(),
                 expires_at=r.expires_at.isoformat(),
+                is_error=r.is_error,
+                error_code=r.error_code,
             )
             for r in results
         ],
