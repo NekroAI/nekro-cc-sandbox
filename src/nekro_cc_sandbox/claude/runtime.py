@@ -368,7 +368,9 @@ class ClaudeRuntime:
                     for attempt in range(2):
                         claude_cmd = self._build_claude_cmd(prompt=message, session_id=attempt_resume_id)
                         cmd = self._build_pseudotty_wrapper_cmd(claude_cmd)
-                        logger.debug(f"[ClaudeRuntime] Exec(attempt={attempt}): {cmd!r} (cwd={workspace.path})")
+                        # 记录实际执行的命令（脱敏 prompt 内容）
+                        _cmd_preview = [c if c != message else f"<prompt:{len(message)}chars>" for c in claude_cmd]
+                        logger.info(f"[ClaudeRuntime] ⚡ Spawning CLI (attempt={attempt}): {_cmd_preview!r}")
 
                         proc = await asyncio.create_subprocess_exec(
                             *cmd,
@@ -456,9 +458,10 @@ class ClaudeRuntime:
                                                     tool_calls_seen.append(tool_name)
                                                 if tool_use_id not in yielded_tool_use_ids:
                                                     yielded_tool_use_ids.add(tool_use_id)
+                                                    _tool_elapsed = time.monotonic() - start_time
                                                     logger.info(
                                                         f"[ClaudeRuntime] ⚙ Tool call: {tool_name}"
-                                                        f" (workspace={workspace_id})"
+                                                        f" (t={_tool_elapsed:.1f}s workspace={workspace_id})"
                                                     )
                                                     yield ToolCallEvent(
                                                         tool_use_id=tool_use_id,
@@ -502,10 +505,13 @@ class ClaudeRuntime:
                                 usage = obj.get("usage") or {}
                                 in_tok = usage.get("input_tokens", "?")
                                 out_tok = usage.get("output_tokens", "?")
+                                _result_len = len(result_text) if isinstance(result_text, str) else 0
+                                _elapsed_result = time.monotonic() - start_time
                                 if not is_error:
                                     logger.info(
                                         f"[ClaudeRuntime] ✦ Result: subtype={subtype!r} "
                                         f"tokens(in={in_tok} out={out_tok}) "
+                                        f"result_len={_result_len} elapsed={_elapsed_result:.1f}s "
                                         f"workspace={workspace_id}"
                                     )
                                 else:
@@ -513,6 +519,7 @@ class ClaudeRuntime:
                                     logger.warning(
                                         f"[ClaudeRuntime] ✗ Result error: subtype={subtype!r} "
                                         f"tokens(in={in_tok} out={out_tok}) "
+                                        f"result_len={_result_len} elapsed={_elapsed_result:.1f}s "
                                         f"workspace={workspace_id} "
                                         f"result_preview={result_preview!r}"
                                     )
@@ -533,9 +540,56 @@ class ClaudeRuntime:
                                         "permission_denials_preview": pd_preview if isinstance(permission_denials, list) else permission_denials,
                                         "errors_preview": preview if cli_errors else None,
                                     }
+                                # result 是 CLI 的最终输出，后面不会有任何有意义的数据。
+                                # 必须立即 break 跳出 stdout 读取循环，否则 script(1) 伪终端
+                                # wrapper 可能迟迟不关闭 stdout，导致 readline() 无限阻塞，
+                                # 进而让整条 SSE 数据流停滞、NA 侧超时。
+                                break
 
-                        stderr_bytes = await proc.stderr.read()
-                        _ = await proc.wait()
+                        # 收到 result 后主动 break，进程可能仍在运行（会话持久化等清理工作）。
+                        # 分级等待策略：给 CLI 足够的时间完成会话写入，避免下次 --resume 时丢失上下文。
+                        #   阶段1: 等 60s 正常退出（CLI 持久化大型会话可能需要较长时间）
+                        #   阶段2: SIGTERM 优雅终止 + 5s 等待
+                        #   阶段3: SIGKILL 强制杀进程
+                        _wait_start = time.monotonic()
+                        try:
+                            stderr_bytes = await asyncio.wait_for(proc.stderr.read(), timeout=10.0)
+                        except (TimeoutError, Exception):
+                            stderr_bytes = b""
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=60.0)
+                            logger.debug(
+                                f"[ClaudeRuntime] Process exited normally after result: "
+                                f"wait={time.monotonic() - _wait_start:.1f}s "
+                                f"exit={proc.returncode} workspace={workspace_id}"
+                            )
+                        except TimeoutError:
+                            logger.warning(
+                                f"[ClaudeRuntime] Process did not exit within 60s after result, "
+                                f"sending SIGTERM. workspace={workspace_id} pid={proc.pid}"
+                            )
+                            try:
+                                proc.terminate()
+                            except ProcessLookupError:
+                                pass
+                            try:
+                                await asyncio.wait_for(proc.wait(), timeout=5.0)
+                            except TimeoutError:
+                                logger.warning(
+                                    f"[ClaudeRuntime] SIGTERM ignored, sending SIGKILL. "
+                                    f"workspace={workspace_id} pid={proc.pid}"
+                                )
+                                try:
+                                    proc.kill()
+                                except ProcessLookupError:
+                                    pass
+                                try:
+                                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                                except TimeoutError:
+                                    logger.error(
+                                        f"[ClaudeRuntime] Process unkillable! "
+                                        f"workspace={workspace_id} pid={proc.pid}"
+                                    )
                         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
                         if proc.returncode not in (0, None):
                             logger.warning(
