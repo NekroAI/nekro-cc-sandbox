@@ -77,10 +77,10 @@ async def send_message(request: Request, body: MessageRequest) -> MessageRespons
 
     try:
         session = await runtime.start(workspace_id)
-        response_chunks = []
-        from ..claude.runtime import QueueWaitEvent
+        response_chunks: list[str] = []
+        from ..claude.runtime import QueueWaitEvent, ToolCallEvent, ToolResultEvent
         async for item in runtime.send_message_in_workspace(workspace_id, body.content, body.source_chat_key, extra_env=body.env_vars or None):
-            if isinstance(item, QueueWaitEvent):
+            if isinstance(item, (QueueWaitEvent, ToolCallEvent, ToolResultEvent)):
                 continue
             response_chunks.append(item)
 
@@ -271,8 +271,15 @@ async def send_message_stream(request: Request, body: MessageRequest):
                     f"workspace={workspace_id!r} source_chat_key={source_chat_key!r} "
                     f"chars={len(full_result)}"
                 )
-            # 错误结果也暂存（标记 is_error），让 NA Watcher 能感知到错误
-            elif error_message and source_chat_key and pending_store is not None:
+            # 错误结果暂存（标记 is_error），让 NA Watcher 能感知到错误。
+            # 例外：TASK_CANCELLED 是 NA 主动发起的取消，NA 侧已通过 SSE 流实时感知，
+            # 无需再通过 PendingResultStore 二次投递，避免 NA 收到重复的"任务失败"通知。
+            elif (
+                error_message
+                and source_chat_key
+                and pending_store is not None
+                and error_code != "TASK_CANCELLED"
+            ):
                 pending_store.add(
                     workspace_id, source_chat_key, error_message,
                     is_error=True, error_code=error_code,
@@ -281,6 +288,11 @@ async def send_message_stream(request: Request, body: MessageRequest):
                     f"[messages] 客户端已断开，CC 错误已暂存: "
                     f"workspace={workspace_id!r} source_chat_key={source_chat_key!r} "
                     f"error_code={error_code!r}"
+                )
+            elif error_message and error_code == "TASK_CANCELLED":
+                logger.debug(
+                    f"[messages] TASK_CANCELLED 不暂存（NA 已通过 SSE 实时感知）: "
+                    f"workspace={workspace_id!r} source_chat_key={source_chat_key!r}"
                 )
             else:
                 logger.debug(

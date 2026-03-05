@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import time
 from collections import Counter, deque
 from collections.abc import AsyncGenerator, Callable
@@ -183,15 +184,26 @@ class ClaudeRuntime:
         }
 
     async def force_cancel_workspace_task(self, workspace_id: str) -> bool:
-        """强制终止工作区当前正在运行的任务（kill 子进程）。"""
+        """强制终止工作区当前正在运行的任务（杀整个进程组）。
+
+        由于子进程通过 start_new_session=True 启动，script(1) 及其子进程
+        （claude、bash 等）同属一个进程组。使用 os.killpg 向整个进程组发送
+        SIGKILL，确保 pty 主端 EOF，避免 stdout.readline() 永久阻塞导致锁无法释放。
+        """
         proc = self._workspace_procs.get(workspace_id)
         current_task = self._workspace_current_task.get(workspace_id)
         if proc is not None and proc.returncode is None:
             self._workspace_force_cancelled[workspace_id] = True
             try:
-                proc.kill()
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            except OSError:
+                # 进程组不存在或权限问题，回退到单进程 kill
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
             task_desc = ""
             if current_task:
                 task_desc = (
@@ -199,7 +211,7 @@ class ClaudeRuntime:
                     f" elapsed={current_task.elapsed_seconds:.1f}s"
                 )
             logger.warning(
-                f"[ClaudeRuntime] ✂ Force cancelled task:"
+                f"[ClaudeRuntime] ✂ Force cancelled task (process group SIGKILL):"
                 f" workspace={workspace_id} pid={proc.pid}{task_desc}"
             )
             return True
@@ -379,6 +391,12 @@ class ClaudeRuntime:
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
                             env=env,
+                            # 将 script(1) 及其所有子进程（claude、bash 等）置于独立进程组，
+                            # 使 force_cancel 时可通过 os.killpg 一次性杀死整个进程组，
+                            # 确保 pty 主端 EOF，避免 stdout.readline() 永久阻塞。
+                            start_new_session=True,
+                            # 默认 64KB limit 在 Read 大文件时会触发 LimitOverrunError，扩大到 10MB
+                            limit=10 * 1024 * 1024,
                         )
                         # 保存进程引用（供 force_cancel_workspace_task 使用）
                         self._workspace_procs[workspace_id] = proc
@@ -566,28 +584,34 @@ class ClaudeRuntime:
                         except TimeoutError:
                             logger.warning(
                                 f"[ClaudeRuntime] Process did not exit within 60s after result, "
-                                f"sending SIGTERM. workspace={workspace_id} pid={proc.pid}"
+                                f"sending SIGTERM to process group. workspace={workspace_id} pid={proc.pid}"
                             )
                             try:
-                                proc.terminate()
-                            except ProcessLookupError:
-                                pass
+                                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                            except (ProcessLookupError, OSError):
+                                try:
+                                    proc.terminate()
+                                except ProcessLookupError:
+                                    pass
                             try:
                                 await asyncio.wait_for(proc.wait(), timeout=5.0)
                             except TimeoutError:
                                 logger.warning(
-                                    f"[ClaudeRuntime] SIGTERM ignored, sending SIGKILL. "
+                                    f"[ClaudeRuntime] SIGTERM ignored, sending SIGKILL to process group. "
                                     f"workspace={workspace_id} pid={proc.pid}"
                                 )
                                 try:
-                                    proc.kill()
-                                except ProcessLookupError:
-                                    pass
+                                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                                except (ProcessLookupError, OSError):
+                                    try:
+                                        proc.kill()
+                                    except ProcessLookupError:
+                                        pass
                                 try:
                                     await asyncio.wait_for(proc.wait(), timeout=5.0)
                                 except TimeoutError:
                                     logger.error(
-                                        f"[ClaudeRuntime] Process unkillable! "
+                                        f"[ClaudeRuntime] Process group unkillable! "
                                         f"workspace={workspace_id} pid={proc.pid}"
                                     )
                         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -714,8 +738,35 @@ class ClaudeRuntime:
                 queued_list.remove(task_info)
 
     async def shutdown(self) -> None:
-        """Shutdown runtime (no persistent subprocess)."""
+        """Shutdown runtime: kill all running processes, then clear sessions."""
         logger.info("[ClaudeRuntime] Shutting down...")
+
+        # 终止所有仍在运行的工作区进程
+        for ws_id, proc in list(self._workspace_procs.items()):
+            if proc is not None and proc.returncode is None:
+                logger.warning(
+                    f"[ClaudeRuntime] Shutdown: killing running process "
+                    f"workspace={ws_id} pid={proc.pid}"
+                )
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except TimeoutError:
+                    logger.error(
+                        f"[ClaudeRuntime] Shutdown: process unkillable "
+                        f"workspace={ws_id} pid={proc.pid}"
+                    )
+
+        self._workspace_procs.clear()
+        self._workspace_current_task.clear()
+        self._workspace_queued_tasks.clear()
+        self._workspace_force_cancelled.clear()
         self._sessions.clear()
         logger.info("[ClaudeRuntime] Shutdown complete")
 
@@ -792,6 +843,8 @@ class ClaudeRuntime:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, **self._get_env_overrides()},
+            start_new_session=True,
+            limit=10 * 1024 * 1024,
         )
 
         assert proc.stdout is not None
@@ -821,14 +874,29 @@ class ClaudeRuntime:
                     # 拿到 tools 后立即结束：避免为了“探测工具”继续消耗 token
                     break
 
-        # 若已获取 tools，尽快终止子进程（print 模式后续会继续生成响应文本）
+        # 若已获取 tools，尽快终止进程组（print 模式后续会继续生成响应文本）
         if tools is not None and proc.returncode is None:
-            proc.terminate()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
             except TimeoutError:
-                proc.kill()
-                await proc.wait()
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except TimeoutError:
+                    logger.error(
+                        f"[ClaudeRuntime] Probe: process unkillable after SIGKILL "
+                        f"workspace={workspace_id} pid={proc.pid}"
+                    )
 
         stderr_bytes = await proc.stderr.read()
         _ = await proc.wait()
