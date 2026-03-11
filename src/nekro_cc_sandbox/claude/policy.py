@@ -89,7 +89,6 @@ class RuntimePolicy:
                 "AskUserQuestion",
                 "EnterPlanMode",
                 "ExitPlanMode",
-                "Skill",
                 "TaskOutput",
                 "TaskStop",
                 "ToolSearch",
