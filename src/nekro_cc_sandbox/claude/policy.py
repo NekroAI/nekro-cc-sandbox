@@ -80,6 +80,7 @@ class RuntimePolicy:
                 "Write",
                 "Edit",
                 "Bash",
+                "Skill",
                 "Task",
                 "WebFetch",
                 "WebSearch",
