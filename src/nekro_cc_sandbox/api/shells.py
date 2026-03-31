@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from loguru import logger
@@ -13,6 +14,21 @@ from ..errors import new_err_id
 from .schemas import OkResponse, ShellCreateResponse, ShellInfo, ShellListResponse
 
 router = APIRouter()
+
+
+def _is_authorized_websocket(websocket: WebSocket) -> bool:
+    expected_token = getattr(websocket.app.state, "internal_api_token", "")
+    if not expected_token:
+        return False
+
+    auth_header = websocket.headers.get("authorization", "")
+    prefix = "Bearer "
+    if auth_header.startswith(prefix):
+        provided_token = auth_header[len(prefix):].strip()
+        return bool(provided_token) and secrets.compare_digest(provided_token, expected_token)
+
+    query_token = (websocket.query_params.get("token") or "").strip()
+    return bool(query_token) and secrets.compare_digest(query_token, expected_token)
 
 
 class CreateShellRequest(BaseModel):
@@ -89,7 +105,12 @@ async def close_shell(shell_id: str, request: Request) -> OkResponse:
 @router.websocket("/shells/{shell_id}/ws")
 async def shell_ws(websocket: WebSocket, shell_id: str):
     """Shell 交互 WebSocket。"""
+    if not _is_authorized_websocket(websocket):
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
+
     mgr = getattr(websocket.app.state, "shell_manager", None)
     if mgr is None:
         await websocket.send_text(json.dumps({"type": "error", "message": "Shell manager not available"}))
@@ -145,4 +166,3 @@ async def shell_ws(websocket: WebSocket, shell_id: str):
             await websocket.close()
         except Exception:
             pass
-

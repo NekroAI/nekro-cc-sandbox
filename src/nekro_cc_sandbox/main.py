@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import secrets
 import sys
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError
@@ -99,6 +100,7 @@ async def lifespan(app: FastAPI):
     # Load settings
     settings_path = Path(os.getenv("SETTINGS_PATH", "./data/settings.json"))
     app.state.settings = Settings.load(settings_path)
+    app.state.internal_api_token = os.getenv("INTERNAL_API_TOKEN", "").strip()
 
     # Initialize Claude Code runtime
     # 产品默认：对外提供"非交互自动运行"的沙盒 agent
@@ -218,6 +220,20 @@ def _is_silent_request(method: str, path: str) -> bool:
     return path == "/health" or any(path.startswith(p) for p in _SILENT_GET_PREFIXES)
 
 
+def _is_authorized_request(request: Request) -> bool:
+    expected_token = getattr(request.app.state, "internal_api_token", "")
+    if not expected_token:
+        return False
+
+    auth_header = request.headers.get("authorization", "")
+    prefix = "Bearer "
+    if not auth_header.startswith(prefix):
+        return False
+
+    provided_token = auth_header[len(prefix):].strip()
+    return bool(provided_token) and secrets.compare_digest(provided_token, expected_token)
+
+
 # 请求日志中间件
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -239,6 +255,19 @@ async def log_requests(request: Request, call_next):
         logger.debug(f"← {method} {path} - {response.status_code}")
 
     return response
+
+
+@app.middleware("http")
+async def verify_internal_api_token(request: Request, call_next):
+    """校验 NA -> sandbox 的内部鉴权 token。"""
+    path = request.url.path
+    if path == "/health" or not path.startswith("/api/v1/"):
+        return await call_next(request)
+
+    if not _is_authorized_request(request):
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+
+    return await call_next(request)
 
 
 # Include API routers FIRST (before catch-all frontend route)
