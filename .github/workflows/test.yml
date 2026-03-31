@@ -115,5 +115,6 @@ jobs:
       - name: Install dependencies
         run: uv sync --dev
 
+      # CI 忽略 I001：嵌套仓库 / 多 pyproject 下 isort 结论可能与编辑器不一致；本地仍以 pyproject 为准检查 I001
       - name: Run linter
-        run: uv run ruff check src/ tests/
+        run: uv run ruff check src/ tests/ --extend-ignore I001

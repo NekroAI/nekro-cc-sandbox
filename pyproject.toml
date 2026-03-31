@@ -1,6 +1,6 @@
 [project]
 name = "nekro-cc-sandbox"
-version = "0.1.12"
+version = "0.1.14"
 description = "A Persistent Workspace Agent powered by Claude Code"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -24,7 +24,8 @@ dev = [
     "pytest-asyncio>=1.0.0",
     "pytest-cov>=6.0.0",
     "pytest-mock>=3.14.0",
-    "ruff>=0.8.0",
+    # 与仓库根目录 uv.lock 中的 ruff 版本保持一致，避免编辑器（根 .venv）与子项目 `uv run ruff` 的 I001 行为不一致
+    "ruff==0.14.10",
     "pyright>=1.1.0",
 ]
 
@@ -50,6 +51,9 @@ target-version = "py313"
 select = ["E", "F", "I", "UP"]
 ignore = ["E501"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["nekro_cc_sandbox"]
+
 [tool.basedpyright]
 pythonVersion = "3.13"
 typeCheckingMode = "basic"
@@ -60,7 +64,7 @@ dev = [
     "pytest-asyncio>=1.0.0",
     "pytest-cov>=6.0.0",
     "pytest-mock>=3.14.0",
-    "ruff>=0.8.0",
+    "ruff==0.14.10",
     "pyright>=1.1.0",
     "poethepoet>=0.40.0",
 ]

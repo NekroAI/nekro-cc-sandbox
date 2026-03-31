@@ -40,8 +40,9 @@ jobs:
       - name: Install dependencies
         run: uv sync --dev
 
+      # CI 忽略 I001：见 test.yml 中 lint 步骤说明
       - name: Lint
-        run: uv run ruff check src/ tests/
+        run: uv run ruff check src/ tests/ --extend-ignore I001
 
       - name: Unit tests
         run: uv run pytest tests/unit -v --tb=short
